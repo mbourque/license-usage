@@ -1,0 +1,49 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# C build artifacts
+dist/
+build/
+*.o
+*.obj
+*.exe
+*.ilk
+*.pdb
+
+# Virtual / generated license tooling output
+ptcstatus_output.txt
+license_usage.csv
+report_out.txt
+
+# FlexLM / PTC logs (often large; keep local)
+ptc_d.log
+ptc_d.log.*
+*.log
+*.log.big
+
+# Plot / report images
+*.png
+*.jpeg
+*.jpg
+*.svg
+*.pdf
+*.eps
+*.tif
+*.tiff
+*.webp
+
+# OS / editor
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*~
