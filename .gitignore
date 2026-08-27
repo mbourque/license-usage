@@ -21,6 +21,7 @@ build/
 ptcstatus_output.txt
 license_usage.csv
 report_out.txt
+license_report.html
 
 # FlexLM / PTC logs (often large; keep local)
 ptc_d.log
