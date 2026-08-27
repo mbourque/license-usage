@@ -1,0 +1,11 @@
+# PTC feature ID / name → product name lookup
+# Format: <feature> = <name>
+
+10113 = Creo Prismatics and Multi-Surfaces Milling Extension
+10119 = Creo Advanced Assembly Extension
+CREOSCHEM_Lite = Creo Schematics Lite
+MECELITEENG_License = Creo Simulation Elite ENG
+MECELITEUI_License = Creo Simulation Elite UI
+PROBUNDLE_10113 = Creo Prismatics and Multi-Surfaces Milling Extension
+PROBUNDLE_10119 = Creo Advanced Assembly Extension
+PROE_DesignEss = Creo Design Essentials
