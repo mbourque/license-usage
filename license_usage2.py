@@ -27,6 +27,11 @@ from pathlib import Path
 DEFAULT_LOG_FILE = r"C:\dev\License usage 2\lanteris\ptclmgrd.log"
 
 DEFAULT_STATUS_FILE = ""  # leave blank to ignore owned-seat file; usage-only report
+# PTC license.dat (or license pack export). Blank = do not load owned counts from a pack.
+# Same feature listed more than once is summed. Bundle defs with count 99999 are skipped.
+# LICENSE_FILE = r"C:\dev\License usage 2\rheinmetall\license.dat"
+LICENSE_FILE = r"C:\dev\License usage 2\lanteris\license.dat"
+
 # DEFAULT_LICENSES = "PROE_DesignEss"  # blank = report every feature found in the log
 DEFAULT_LICENSES = ""  # blank = report every feature found in the log
 DEFAULT_LOOKBACK_DAYS = 180   # 0 = entire log
@@ -48,12 +53,17 @@ OUT_PATTERN = re.compile(r'OUT:\s+"([^"]+)"\s+(\S+)')
 IN_PATTERN = re.compile(r'IN:\s+"([^"]+)"\s+(\S+)')
 DENIED_PATTERN = re.compile(r'DENIED:\s+"([^"]+)"\s+(\S+)\s+\(([^)]*)\)')
 STATUS_LICENSE_PATTERN = re.compile(r"^\s*(\S+)\s+(\d+)\s+(\d+)\s*$")
+# INCREMENT feature daemon version expiry count ...
+INCREMENT_OWNED_PATTERN = re.compile(
+    r"^INCREMENT\s+(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)\b"
+)
 SERVER_STARTED_PATTERN = re.compile(r"Server started on")
 EXPIRED_PATTERN = re.compile(r"EXPIRED:\s+(\S+)")
 EXPIRES_WARNING_PATTERN = re.compile(
     r"Warning:\s+(\S+)\s+expires\s+(\d{1,2}-\w{3}-\d{4})", re.IGNORECASE
 )
 SATURATION_DENIAL = "Licensed number of users already reached"
+BUNDLE_PLACEHOLDER_COUNT = 99999
 MONTHS = {
     "Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
     "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12,
@@ -88,6 +98,16 @@ def display_name(feature, lookup):
     return feature
 
 
+def normalize_user(user):
+    """
+    Case-fold user@host so the same Windows account counts as one seat.
+
+    Creo/FlexLM logs sometimes vary casing (rbrock@HOST vs RBROCK@HOST);
+    FlexLM treats those as one holder.
+    """
+    return user.casefold()
+
+
 def parse_owned_seats(status_file):
     """Parse ptcstatus output. Owned seats = In Use + Free."""
     owned = {}
@@ -113,6 +133,27 @@ def parse_owned_seats(status_file):
     return owned
 
 
+def parse_license_dat(license_file):
+    """
+    Parse PTC license.dat INCREMENT lines for owned seat counts.
+
+    If the same feature appears more than once, counts are summed.
+    Bundle definition rows with count 99999 are skipped.
+    """
+    owned = defaultdict(int)
+    with open(license_file, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            match = INCREMENT_OWNED_PATTERN.match(line.lstrip())
+            if not match:
+                continue
+            name, count_s = match.groups()
+            count = int(count_s)
+            if count >= BUNDLE_PLACEHOLDER_COUNT:
+                continue
+            owned[name] += count
+    return dict(owned)
+
+
 def parse_capacity_override(text):
     """Parse Feature=N|Feature2=M style overrides."""
     if not text:
@@ -133,8 +174,8 @@ class FeatureStats:
     def __init__(self, name, owned):
         self.name = name
         self.owned = owned  # explicit override from config/status, if any
-        self.concurrent = 0  # unique user@host currently holding a seat
-        self.holders = defaultdict(int)  # user@host -> open checkout count
+        self.concurrent = 0  # unique user@host currently holding a seat (case-insensitive)
+        self.holders = defaultdict(int)  # normalized user@host -> open checkout count
         self.peak_overall = 0
         self.peak_overall_when = None
         self.daily_peak = defaultdict(int)
@@ -154,7 +195,8 @@ class FeatureStats:
         self.holders.clear()
 
     def checkout(self, user):
-        """Record OUT. Same user@host already holding a seat does not add another."""
+        """Record OUT. Same user@host (ignoring case) already holding does not add another."""
+        user = normalize_user(user)
         prev = self.holders[user]
         self.holders[user] = prev + 1
         if prev == 0:
@@ -164,6 +206,7 @@ class FeatureStats:
 
     def checkin(self, user):
         """Record IN. Seat freed only when this user@host has no remaining checkouts."""
+        user = normalize_user(user)
         prev = self.holders.get(user, 0)
         if prev <= 0:
             return False
@@ -176,18 +219,18 @@ class FeatureStats:
 
     def predict_owned_seats(self):
         """
-        Predict owned seats.
+        Resolve owned seat count.
 
-        Hard rule: successful concurrent checkouts cannot exceed owned seats,
-        so owned >= historical peak. A saturation DENIED means the pool was
-        full at that moment (holders in use then). If that number is lower
-        than peak, capacity changed (e.g. expiry) — report both.
+        Prefer explicit owned from license.dat / status / capacity. Otherwise
+        infer from denials and peak: successful concurrent checkouts cannot
+        exceed owned seats, so owned >= historical peak. A saturation DENIED
+        means the pool was full at that moment.
         """
         if self.owned is not None:
             return {
                 "count": self.owned,
-                "confidence": "configured",
-                "detail": "from DEFAULT_CAPACITY / --capacity / status file",
+                "confidence": "owned",
+                "detail": "from LICENSE_FILE (license.dat) / status file / DEFAULT_CAPACITY / --capacity",
                 "lower_bound": self.owned,
                 "at_denial": None,
                 "note": None,
@@ -223,7 +266,8 @@ class FeatureStats:
                 note = (
                     f"Capacity changed over the log: historical peak {peak}, "
                     f"but denials saw a full pool at {at_denial}. "
-                    f"Primary prediction uses {predicted} (cannot be below peak)."
+                    f"Using {predicted} as the inferred owned count "
+                    f"(cannot be below peak)."
                 )
                 if self.expiry_events:
                     last = self.expiry_events[-1]
@@ -259,7 +303,7 @@ class FeatureStats:
         return {
             "count": None,
             "confidence": "none",
-            "detail": "no usage and no denials — cannot predict",
+            "detail": "no usage and no denials — cannot determine owned count",
             "lower_bound": 0,
             "at_denial": None,
             "note": None,
@@ -269,7 +313,9 @@ class FeatureStats:
         """Capacity used for UNDER/OVER judgment."""
         pred = self.predict_owned_seats()
         if pred["count"] is not None:
-            return pred["count"], f"predicted owned ({pred['confidence']})"
+            if pred["confidence"] == "owned":
+                return pred["count"], "owned seats"
+            return pred["count"], f"inferred owned ({pred['confidence']} confidence)"
         return None, None
 
 
@@ -367,16 +413,17 @@ def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0
             out_match = OUT_PATTERN.search(line)
             if out_match:
                 feature, user = out_match.groups()
+                user_key = normalize_user(user)
                 if feature_set is not None and feature not in feature_set:
                     continue
-                if user_set is not None and user not in user_set:
+                if user_set is not None and user_key not in user_set:
                     continue
                 s = get_stats(feature)
-                took_new_seat = s.checkout(user)
+                took_new_seat = s.checkout(user_key)
 
                 if in_report_window(current_date, now, lookback_days, reporting_days):
                     s.out_count += 1
-                    s.users_seen.add(user)
+                    s.users_seen.add(user_key)
                     if took_new_seat:
                         if s.concurrent > s.daily_peak[current_date]:
                             s.daily_peak[current_date] = s.concurrent
@@ -388,12 +435,13 @@ def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0
             in_match = IN_PATTERN.search(line)
             if in_match:
                 feature, user = in_match.groups()
+                user_key = normalize_user(user)
                 if feature_set is not None and feature not in feature_set:
                     continue
-                if user_set is not None and user not in user_set:
+                if user_set is not None and user_key not in user_set:
                     continue
                 s = get_stats(feature)
-                s.checkin(user)
+                s.checkin(user_key)
                 if in_report_window(current_date, now, lookback_days, reporting_days):
                     s.in_count += 1
                 continue
@@ -401,9 +449,10 @@ def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0
             denied_match = DENIED_PATTERN.search(line)
             if denied_match:
                 feature, user, reason = denied_match.groups()
+                user_key = normalize_user(user)
                 if feature_set is not None and feature not in feature_set:
                     continue
-                if user_set is not None and user not in user_set:
+                if user_set is not None and user_key not in user_set:
                     continue
                 if SATURATION_DENIAL not in reason:
                     continue
@@ -413,12 +462,12 @@ def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0
                 s = get_stats(feature)
                 s.denial_raw += 1
                 # Collapse Creo retry bursts: same feature/user/second = one event
-                denial_key = (current_date, current_time_str, feature, user)
+                denial_key = (current_date, current_time_str, feature, user_key)
                 if denial_key != s._last_denial_key:
                     s._last_denial_key = denial_key
                     s.denial_events += 1
                     s.denial_by_day[current_date] += 1
-                    s.denial_users[user] += 1
+                    s.denial_users[user_key] += 1
                     # DENIED => pool full => holders in use = owned seats
                     s.denial_holder_samples.append(s.concurrent)
 
@@ -456,10 +505,13 @@ def classify_feature(s):
             f"Peak holders: {s.peak_overall}.",
         ]
         if pred["count"] is not None:
-            parts.append(
-                f"Predicted owned: {pred['count']} "
-                f"({pred['confidence']} confidence)."
-            )
+            if pred["confidence"] == "owned":
+                parts.append(f"Owned seats: {pred['count']}.")
+            else:
+                parts.append(
+                    f"Inferred owned seats: {pred['count']} "
+                    f"({pred['confidence']} confidence)."
+                )
             if pred.get("at_denial") is not None and pred["at_denial"] != pred["count"]:
                 parts.append(
                     f"In use at DENIED was {pred['at_denial']} "
@@ -508,6 +560,32 @@ def status_bucket(label):
     return "unknown"
 
 
+def had_window_usage(s):
+    """True if the feature had checkout / denial activity in the report window."""
+    return bool(
+        s.out_count
+        or s.in_count
+        or s.denial_events
+        or s.denial_raw
+        or s.peak_overall
+        or s.users_seen
+        or s.daily_peak
+    )
+
+
+def include_in_report(s):
+    """
+    Keep features that were used in the window, or that have a known owned
+    count from license.dat / status / capacity. Drop noise like legacy
+    features seen only outside the window with no owned seats.
+    """
+    if had_window_usage(s):
+        return True
+    if s.owned is not None:
+        return True
+    return False
+
+
 def plain_meaning(s, label, lookup):
     """One short paragraph a non-expert can act on."""
     name = display_name(s.name, lookup)
@@ -522,10 +600,13 @@ def plain_meaning(s, label, lookup):
     if bucket == "over":
         owned_bit = ""
         if pred["count"] is not None:
-            owned_bit = (
-                f" The pool looks like about {pred['count']} seat(s) "
-                f"(from denials / peak evidence)."
-            )
+            if pred["confidence"] == "owned":
+                owned_bit = f" Owned seats: {pred['count']}."
+            else:
+                owned_bit = (
+                    f" Inferred pool size: about {pred['count']} seat(s) "
+                    f"(from denials / peak evidence)."
+                )
         return (
             f"{name} ran out of seats. FlexLM blocked people "
             f"{s.denial_events} time(s) on {len(s.denial_by_day)} day(s). "
@@ -566,7 +647,7 @@ def ordered_features(stats):
 
 def build_executive_summary(stats, lookup):
     """Short bullets for the top of the HTML report."""
-    ordered = ordered_features(stats)
+    ordered = [s for s in ordered_features(stats) if include_in_report(s)]
     counts = defaultdict(int)
     total_denials = 0
     for s in ordered:
@@ -599,7 +680,7 @@ def build_executive_summary(stats, lookup):
     if counts["under"]:
         bullets.append(
             f"{counts['under']} feature(s) look under-utilized "
-            f"(peak below predicted owned, no denials). Possible spare capacity."
+            f"(peak below owned seats, no denials). Possible spare capacity."
         )
     if counts["full"]:
         bullets.append(
@@ -647,7 +728,7 @@ def _kv(label, value, label_width=18):
 
 
 def print_report(stats, lookback_days, reporting_days, status_file, log_file, lines_read,
-                 user_computers=None, lookup=None):
+                 user_computers=None, lookup=None, license_file=None):
     lookup = lookup or {}
     _hr("=")
     print("LICENSE USAGE REPORT")
@@ -655,9 +736,12 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
     _hr("=")
     print()
     _kv("Log", log_file)
+    _kv("License.dat", license_file or "(not used)")
     _kv("Status", status_file or "(not used)")
     _kv("Lines", f"{lines_read:,}")
-    _kv("Features", len(stats))
+    ordered = [s for s in ordered_features(stats) if include_in_report(s)]
+    skipped = len(stats) - len(ordered)
+    _kv("Features", len(ordered) if not skipped else f"{len(ordered)}  ({skipped} hidden: no usage, no owned)")
     if lookback_days or reporting_days:
         _kv("Window", f"lookback={lookback_days}, reporting={reporting_days}")
     else:
@@ -669,14 +753,12 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
     print()
     print(_wrap(
         "OVER = denials prove seats ran out. "
-        "UNDER = peak below predicted owned, no denials. "
+        "UNDER = peak below owned seats (from license.dat when provided), no denials. "
         "Owned >= peak concurrent (successful checkouts cannot exceed seats). "
         "DENIED means pool full at that moment.",
         indent=2,
     ))
     print()
-
-    ordered = ordered_features(stats)
 
     for s in ordered:
         avg_daily_peak = (
@@ -703,9 +785,15 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
 
         print("  Owned seats")
         if pred["count"] is not None:
-            _kv("Predicted", f"{pred['count']}  [{pred['confidence']} confidence]")
+            if pred["confidence"] == "owned":
+                _kv("Owned", str(pred["count"]))
+            else:
+                _kv(
+                    "Inferred",
+                    f"{pred['count']}  [{pred['confidence']} confidence]",
+                )
         else:
-            _kv("Predicted", f"unknown exact (at least {pred['lower_bound']})")
+            _kv("Exact count", f"unknown (at least {pred['lower_bound']})")
         print(_wrap(pred["detail"], indent=4))
         if pred.get("at_denial") is not None and pred["at_denial"] != pred["count"]:
             _kv("In use at DENIED", pred["at_denial"])
@@ -718,7 +806,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
         if pred["count"] is not None and s.peak_overall > 0:
             pct = 100.0 * s.peak_overall / pred["count"]
             _kv(
-                "Peak vs predicted",
+                "Peak vs owned",
                 f"{s.peak_overall} / {pred['count']}  ({pct:.0f}%)",
             )
         print()
@@ -731,7 +819,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
             _kv("Triggered by", u)
             print(_wrap(
                 "That user was the checkout that raised holders to the peak, "
-                "not the only user. Same user@host = 1 seat.",
+                "not the only user. Same user@host (ignoring case) = 1 seat.",
                 indent=4,
             ))
         _kv("Avg daily peak", f"{avg_daily_peak:.1f}")
@@ -756,9 +844,9 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
                 mark = ""
                 if pred["count"] is not None:
                     if peak == pred["count"]:
-                        mark = "  (at predicted owned)"
+                        mark = "  (at owned)"
                     elif peak > pred["count"]:
-                        mark = "  (above predicted — unexpected)"
+                        mark = "  (above owned — unexpected)"
                 print(f"    {day}   {peak} concurrent{mark}")
             print()
 
@@ -784,10 +872,11 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
     print()
     print("Notes")
     print(_wrap(
-        "Predicted owned is at least the peak concurrent checkouts that "
-        "succeeded (cannot license fewer seats than were in use). DENIED "
-        "means the pool was full then; if in-use at DENIED is lower than "
-        "peak, capacity changed (e.g. expiry). Same user@host = 1 seat.",
+        "Owned seats come from LICENSE_FILE (license.dat) when set. "
+        "Otherwise they may be inferred from denials: owned is at least the "
+        "peak concurrent checkouts that succeeded. DENIED means the pool was "
+        "full then; if in-use at DENIED is lower than peak, capacity changed "
+        "(e.g. expiry). Same user@host (ignoring case) = 1 seat.",
         indent=2,
     ))
     _hr("=")
@@ -803,10 +892,12 @@ def write_html_report(
     html_path,
     user_computers=None,
     lookup=None,
+    license_file=None,
 ):
     """Write a self-contained HTML dashboard and return its path."""
     lookup = lookup or {}
-    ordered = ordered_features(stats)
+    ordered = [s for s in ordered_features(stats) if include_in_report(s)]
+    skipped = len(stats) - len(ordered)
     bullets, status_counts, total_denials = build_executive_summary(stats, lookup)
     generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -856,16 +947,28 @@ def write_html_report(
     denial_labels = [display_name(s.name, lookup) for s in denial_features]
     denial_values = [s.denial_events for s in denial_features]
 
-    # Utilization % where owned known
+    # Utilization % where owned known — bar color matches card status (OVER = denials)
     util_labels = []
     util_values = []
+    util_colors = []
+    bucket_bar_colors = {
+        "over": "#c0392b",
+        "under": "#1f6f8b",
+        "full": "#2f7d4a",
+        "unused": "#7a756c",
+        "unknown": "#b08900",
+    }
     for s in ordered:
         pred = s.predict_owned_seats()
         if pred["count"] and pred["count"] > 0 and s.peak_overall > 0:
+            label, _ = classify_feature(s)
+            bucket = status_bucket(label)
             util_labels.append(display_name(s.name, lookup))
             util_values.append(round(100.0 * s.peak_overall / pred["count"], 1))
+            util_colors.append(bucket_bar_colors.get(bucket, "#1f6f8b"))
     util_labels = util_labels[:15]
     util_values = util_values[:15]
+    util_colors = util_colors[:15]
 
     feature_cards = []
     for s in ordered:
@@ -921,6 +1024,7 @@ def write_html_report(
         "denialValues": denial_values,
         "utilLabels": util_labels,
         "utilValues": util_values,
+        "utilColors": util_colors,
     }
 
     def esc(text):
@@ -929,13 +1033,17 @@ def write_html_report(
     card_html_parts = []
     for card in feature_cards:
         owned_txt = (
-            f"{card['owned']} ({card['owned_confidence']})"
-            if card["owned"] is not None
-            else f"unknown (at least {card['owned_lower']})"
+            str(card["owned"])
+            if card["owned"] is not None and card["owned_confidence"] == "owned"
+            else (
+                f"{card['owned']} (inferred, {card['owned_confidence']})"
+                if card["owned"] is not None
+                else f"unknown (at least {card['owned_lower']})"
+            )
         )
         peak_pct = ""
         if card["owned"] and card["owned"] > 0:
-            peak_pct = f" — {100.0 * card['peak'] / card['owned']:.0f}% of predicted owned"
+            peak_pct = f" — {100.0 * card['peak'] / card['owned']:.0f}% of owned"
 
         days_rows = "".join(
             f"<li><span>{esc(d)}</span><strong>{p}</strong></li>"
@@ -981,7 +1089,7 @@ def write_html_report(
   <p class="detail">{esc(card['explanation'])}</p>
   <div class="metrics">
     <div><span>Peak concurrent</span><strong>{card['peak']}{esc(peak_pct)}</strong></div>
-    <div><span>Predicted owned</span><strong>{esc(owned_txt)}</strong></div>
+    <div><span>Owned seats</span><strong>{esc(owned_txt)}</strong></div>
     <div><span>Denial events</span><strong>{card['denials']}</strong></div>
     <div><span>Distinct users</span><strong>{card['users']}</strong></div>
     <div><span>Active days</span><strong>{card['active_days']}</strong></div>
@@ -1207,8 +1315,10 @@ footer.note {{
       <div><strong>Generated</strong> {esc(generated)}</div>
       <div><strong>Log</strong> {esc(log_file)}</div>
       <div><strong>Lines</strong> {lines_read:,}</div>
+      <div><strong>Features</strong> {len(ordered)}{f" ({skipped} hidden)" if skipped else ""}</div>
       <div><strong>Window</strong> {esc(window)}</div>
       <div><strong>Users</strong> {esc(users_txt)}</div>
+      <div><strong>License.dat</strong> {esc(license_file or "not used")}</div>
       <div><strong>Status file</strong> {esc(status_file or "not used")}</div>
     </div>
   </header>
@@ -1234,15 +1344,15 @@ footer.note {{
       <div class="chart-wrap"><canvas id="pieStatus"></canvas></div>
     </div>
     <div class="chart-card {'hidden' if not util_values else ''}">
-      <h2>Peak use vs predicted owned</h2>
-      <p class="caption">Percent of predicted seats used at the busiest moment (100% = fully used)</p>
+      <h2>Peak use vs owned seats</h2>
+      <p class="caption">Percent of owned seats used at the busiest moment. Bar color matches the feature cards: red = OVER-UTILIZED (denials / ran out), not merely 100% peak.</p>
       <div class="chart-wrap"><canvas id="barUtil"></canvas></div>
     </div>
   </div>
 
   <div class="chart-card {'hidden' if not peak_values else ''}" style="margin-bottom:18px">
     <h2>Peak concurrent users by feature</h2>
-    <p class="caption">Highest number of unique user@host holders at once. Orange markers = predicted owned seats when known.</p>
+    <p class="caption">Highest number of unique user@host holders at once, next to owned seats from license.dat when known.</p>
     <div class="chart-wrap tall"><canvas id="barPeak"></canvas></div>
   </div>
 
@@ -1256,15 +1366,17 @@ footer.note {{
     <h2>How to read this</h2>
     <dl class="guide">
       <dt>Ran out (OVER)</dt>
-      <dd>FlexLM logged DENIED because all seats were already in use. Real users were blocked.</dd>
+      <dd>FlexLM logged DENIED because all seats were already in use. Real users were blocked. Peak can equal owned (100%) and still be OVER if denials occurred.</dd>
       <dt>Spare capacity (UNDER)</dt>
-      <dd>Peak concurrent use stayed below predicted owned seats, and nobody was denied.</dd>
+      <dd>Peak concurrent use stayed below owned seats, and nobody was denied.</dd>
       <dt>Full but no denials</dt>
       <dd>Peak hit the owned count, but the pool still covered demand — watch if usage grows.</dd>
-      <dt>Predicted owned</dt>
-      <dd>When denials occur, holders already checked out ≈ pool size. Without denials, only a lower bound (peak) is known unless you set capacity.</dd>
+      <dt>Owned seats</dt>
+      <dd>Taken from LICENSE_FILE (license.dat) — true purchased counts. Duplicate INCREMENT rows for the same feature are summed. Status/--capacity can override. If no license.dat, counts may be inferred from denials/peak.</dd>
+      <dt>What gets listed</dt>
+      <dd>Features with usage in the report window, or a known owned count from license.dat. Features with neither are hidden.</dd>
       <dt>Same user@host = 1 seat</dt>
-      <dd>One person launching Creo twice on the same computer still counts as one concurrent seat.</dd>
+      <dd>One person launching Creo twice on the same computer still counts as one concurrent seat. Username casing differences (rbrock vs RBROCK) are treated as the same holder.</dd>
     </dl>
   </section>
 
@@ -1272,8 +1384,8 @@ footer.note {{
   {"".join(card_html_parts)}
 
   <footer class="note">
-    Predicted owned is at least the peak concurrent checkouts that succeeded.
-    DENIED means the pool was full at that moment. Source: {esc(os.path.basename(log_file))} · {esc(generated)}
+    Owned seats come from license.dat when LICENSE_FILE is set. DENIED means the pool was full at that moment.
+    Source: {esc(os.path.basename(log_file))} · {esc(generated)}
   </footer>
 </div>
 <script>
@@ -1331,7 +1443,7 @@ if (SHOW.peak && document.getElementById('barPeak')) {{
           borderRadius: 4
         }},
         {{
-          label: 'Predicted owned seats',
+          label: 'Owned seats',
           data: DATA.ownedValues,
           backgroundColor: '#e67e22',
           borderRadius: 4
@@ -1393,11 +1505,9 @@ if (SHOW.util && document.getElementById('barUtil')) {{
     data: {{
       labels: DATA.utilLabels,
       datasets: [{{
-        label: 'Peak as % of predicted owned',
+        label: 'Peak as % of owned seats',
         data: DATA.utilValues,
-        backgroundColor: DATA.utilValues.map(v =>
-          v >= 100 ? '#c0392b' : (v >= 80 ? '#e67e22' : '#1f6f8b')
-        ),
+        backgroundColor: DATA.utilColors,
         borderRadius: 4
       }}]
     }},
@@ -1430,6 +1540,8 @@ def main():
         description="License usage report: peak concurrent use + denials from ptc_d.log"
     )
     parser.add_argument("--log_file", type=str, default=DEFAULT_LOG_FILE)
+    parser.add_argument("--license_file", type=str, default=LICENSE_FILE,
+                        help="PTC license.dat for owned seat counts; blank to skip")
     parser.add_argument("--status_file", type=str, default=DEFAULT_STATUS_FILE,
                         help="Optional ptcstatus file; blank = usage-only")
     parser.add_argument("--licenses", type=str, default=DEFAULT_LICENSES,
@@ -1453,6 +1565,11 @@ def main():
 
     if args.prompt:
         log_file = get_input("Location of ptc_d.log file:", DEFAULT_LOG_FILE)
+        license_file = get_input(
+            "license.dat file (blank to skip):", LICENSE_FILE
+        )
+        if not license_file.strip():
+            license_file = None
         status_file = get_input("ptcstatus output file (blank to skip):", DEFAULT_STATUS_FILE)
         if not status_file.strip():
             status_file = None
@@ -1466,6 +1583,7 @@ def main():
         capacity_text = args.capacity or DEFAULT_CAPACITY
     else:
         log_file = args.log_file
+        license_file = args.license_file or None
         status_file = args.status_file or None
         feature_input = args.licenses
         users_input = args.users
@@ -1474,13 +1592,23 @@ def main():
         capacity_text = args.capacity or DEFAULT_CAPACITY
 
     features = [f.strip() for f in feature_input.split("|") if f.strip()]
-    user_computers = [u.strip() for u in users_input.split("|") if u.strip()] or None
+    user_computers = [
+        normalize_user(u.strip()) for u in users_input.split("|") if u.strip()
+    ] or None
     lookup = load_license_lookup(args.lookup_file)
 
     owned = {}
+    if license_file:
+        try:
+            owned = parse_license_dat(license_file)
+            print(f"Loaded owned seats from {license_file}: {owned}")
+        except FileNotFoundError:
+            print(f"Warning: license.dat not found: {license_file}")
+            license_file = None
+
     if status_file:
         try:
-            owned = parse_owned_seats(status_file)
+            owned.update(parse_owned_seats(status_file))
             print(f"Loaded owned seats from {status_file}: {owned}")
         except FileNotFoundError:
             print(f"Warning: status file not found: {status_file}")
@@ -1509,6 +1637,7 @@ def main():
         stats, lookback_days, reporting_days, status_file, log_file, lines_read,
         user_computers=user_computers,
         lookup=lookup,
+        license_file=license_file,
     )
 
     html_path = write_html_report(
@@ -1521,6 +1650,7 @@ def main():
         args.html_file,
         user_computers=user_computers,
         lookup=lookup,
+        license_file=license_file,
     )
     abs_html = os.path.abspath(html_path)
     print(f"\nHTML dashboard written to: {abs_html}")
