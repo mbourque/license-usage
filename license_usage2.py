@@ -52,7 +52,7 @@ INCREMENT_OWNED_PATTERN = re.compile(
 SERVICEABLE_PATTERN = re.compile(r"^#\s*Serviceable\s*=\s*(.+)$", re.IGNORECASE)
 FEATURE_NAME_PATTERN = re.compile(r"^#\s*Feature Name\s*=\s*(\S+)", re.IGNORECASE)
 DETAIL_TABLE_PATTERN = re.compile(
-    r"^#\S+\s+(.+?)\s+SPN-\S+\s+.+\s+\d+\s+\d{4}-\d{2}-\d{2}\s+([\w,]+)\b"
+    r"^#\S+\s+(.+?)\s+SPN-\S+-([FL])-?\s+.+\s+\d+\s+\d{4}-\d{2}-\d{2}\s+([\w,]+)\b"
 )
 SUMMARY_TABLE_ROW = re.compile(
     r"^#(\S+)\s+\d+\s+(.+?)\s+(?:Creo|Prime)\s+\d+\.\d+\s+(?:Flt|Ext)\s+(?:Lic|Opt)\s+\d{1,2}-\w{3}-\d{4}",
@@ -211,17 +211,38 @@ def merge_display_names(block_names, summary_names):
     return merged
 
 
+def set_license_type(license_types, feature, fl_char):
+    """Map feature -> F (floating) or L (locked); prefer L when detail rows disagree."""
+    if not feature:
+        return
+    if license_types.get(feature) == "L":
+        return
+    license_types[feature] = fl_char
+
+
+def license_type_label(feature, license_types):
+    """Human label from detail-table Product Package Id suffix (-F / -L)."""
+    fl = license_types.get(feature)
+    if fl == "F":
+        return "Floating"
+    if fl == "L":
+        return "Locked"
+    return None
+
+
 def parse_license_dat(license_file):
     """
     Parse PTC license.dat for owned seat counts and feature display names.
 
     Names: license-pack summary table (Product column) when readable, else
     #Serviceable / #Feature Name blocks, with the detail table as fallback
-    (e.g. 10113,PROBUNDLE_10113). Duplicate INCREMENT rows are summed;
-    bundle defs with count 99999 are skipped.
+    (e.g. 10113,PROBUNDLE_10113). Product Package Id suffix in the detail
+    table (-F / -L) records floating vs locked. Duplicate INCREMENT rows are
+    summed; bundle defs with count 99999 are skipped.
     """
     owned = defaultdict(int)
     names = {}
+    license_types = {}
     summary_names = {}
     current_serviceable = None
     in_summary_table = False
@@ -256,10 +277,12 @@ def parse_license_dat(license_file):
             detail_match = DETAIL_TABLE_PATTERN.match(stripped)
             if detail_match:
                 product_name = clean_product_name(detail_match.group(1))
-                for feature in detail_match.group(2).split(","):
+                fl_char = detail_match.group(2)
+                for feature in detail_match.group(3).split(","):
                     feature = feature.strip()
                     if feature and feature not in names:
                         names[feature] = product_name
+                    set_license_type(license_types, feature, fl_char)
                 continue
 
             increment_match = INCREMENT_OWNED_PATTERN.match(stripped)
@@ -271,7 +294,7 @@ def parse_license_dat(license_file):
                 continue
             owned[name] += count
 
-    return dict(owned), merge_display_names(names, summary_names)
+    return dict(owned), merge_display_names(names, summary_names), dict(license_types)
 
 
 def display_name(feature, lookup):
@@ -1147,9 +1170,11 @@ def write_html_report(
     lookup=None,
     license_file=None,
     unsupported_count=0,
+    license_types=None,
 ):
     """Write a self-contained HTML dashboard and return its path."""
     lookup = lookup or {}
+    license_types = license_types or {}
     ordered = [s for s in ordered_features(stats) if include_in_report(s, lookup)]
     bullets, status_counts, total_denials = build_executive_summary(
         stats, lookup, lookback_days, reporting_days, unsupported_count
@@ -1228,6 +1253,7 @@ def write_html_report(
         feature_cards.append({
             "id": s.name,
             "title": display_name(s.name, lookup),
+            "license_type": license_type_label(s.name, license_types),
             "bucket": bucket,
             "label": label,
             "meaning": plain_meaning(s, label, lookup),
@@ -1313,11 +1339,17 @@ def write_html_report(
             )
         side = "".join(side_blocks)
 
+        type_suffix = (
+            f' <span class="lic-type">({esc(card["license_type"])})</span>'
+            if card.get("license_type")
+            else ""
+        )
+
         card_html_parts.append(f"""
 <article class="feature bucket-{esc(card['bucket'])}" id="f-{esc(card['id'])}">
   <header>
     <div>
-      <h3>{esc(card['title'])}</h3>
+      <h3>{esc(card['title'])}{type_suffix}</h3>
       <p class="fid">{esc(card['id'])}</p>
     </div>
     <span class="badge badge-{esc(card['bucket'])}">{esc(card['label'])}</span>
@@ -1473,6 +1505,7 @@ section.panel h2 {{
   flex-wrap: wrap;
 }}
 .feature h3 {{ margin: 0; font-size: 1.12rem; }}
+.lic-type {{ font-weight: 500; font-size: 0.92rem; color: var(--muted); }}
 .fid {{ margin: 2px 0 0; font-size: 0.8rem; color: var(--muted); font-family: ui-monospace, Consolas, monospace; }}
 .badge {{
   display: inline-block;
@@ -1744,9 +1777,10 @@ def main():
     ] or None
     lookup = {}
     owned = {}
+    license_types = {}
     if license_file:
         try:
-            owned, lookup = parse_license_dat(license_file)
+            owned, lookup, license_types = parse_license_dat(license_file)
             print(f"Loaded owned seats from {license_file}: {owned}")
             print(f"Loaded {len(lookup)} feature names from {license_file}")
         except FileNotFoundError:
@@ -1790,6 +1824,7 @@ def main():
         lookup=lookup,
         license_file=license_file,
         unsupported_count=unsupported_count,
+        license_types=license_types,
     )
     abs_html = os.path.abspath(html_path)
     print(f"\nHTML dashboard written to: {abs_html}")

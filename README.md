@@ -72,7 +72,7 @@ After the text report, the script writes a self-contained webpage with:
 - Features with **no usage in the report window** and **no owned count** from `license.dat` are omitted; so are **numeric-only FlexLM IDs** (e.g. `308`) that are not defined in `license.dat` (old optional-module noise)
 - Doughnut chart of utilization outcomes
 - Bar chart for peak vs owned seats %
-- Per-feature cards with “what this means” text (product names from `license.dat`)
+- Per-feature cards with “what this means” text (product names from `license.dat`; **(Floating)** / **(Locked)** from detail-table Product Package Id `SPN-*-F` / `SPN-*-L`)
 
 Charts need network access once to load Chart.js from the CDN.
 
