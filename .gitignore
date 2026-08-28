@@ -22,6 +22,7 @@ ptcstatus_output.txt
 license_usage.csv
 report_out.txt
 license_report.html
+.last_data_folder
 
 # FlexLM / PTC logs (often large; keep local)
 ptc_d.log

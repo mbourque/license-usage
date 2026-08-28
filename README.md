@@ -4,12 +4,12 @@ Tools for analyzing PTC Creo / FlexLM license usage from `ptc_d` server logs.
 
 ## What this answers
 
-From a historical `ptc_d.log`:
+From a historical FlexLM log (`ptc_d.log` or `ptclmgrd.log`):
 
-- **Owned seats** — from customer `license.dat` (`LICENSE_FILE`) when set; duplicate INCREMENT rows for the same feature are **summed**. These are true purchased counts, not estimates
+- **Owned seats** — from customer `license.dat` in the same folder; duplicate INCREMENT rows for the same feature are **summed**. These are true purchased counts, not estimates
 - **OVER-UTILIZED** — FlexLM **DENIED** checkouts (`Licensed number of users already reached`); people were blocked
 - **UNDER-UTILIZED** — peak unique holders below owned seats, and no denials
-- **Inferred owned** — only when no license.dat/status/capacity count is available: denials imply pool size; with no denials, only a lower bound (peak concurrent) is known
+- **Inferred owned** — only when no license.dat/capacity count is available: denials imply pool size; with no denials, only a lower bound (peak concurrent) is known
 
 ## Requirements
 
@@ -26,54 +26,53 @@ python -m venv venv
 
 ## Main script: `license_usage2.py`
 
-Prints a text report, writes `license_report.html`, and opens it in your default browser. Edit defaults at the top of the file, then run:
+Run the script — it asks for:
+
+1. **Customer folder** — must contain `license.dat` and either `ptc_d.log` or `ptclmgrd.log` (if both logs exist, the newest is used)
+2. **Lookback days** — default **180** (`0` = entire log)
 
 ```powershell
 .\venv\Scripts\python.exe license_usage2.py
 ```
 
-Or with CLI overrides:
+Example session:
 
-```powershell
-.\venv\Scripts\python.exe license_usage2.py --log_file "C:\path\to\ptc_d.log" --licenses "" --lookback_days 0 --reporting_days 0
+```
+License Usage Report
+
+Customer folder (license.dat + ptc_d.log or ptclmgrd.log): [C:\dev\License usage 2\lanteris]
+  Log:     C:\dev\License usage 2\rheinmetall\ptc_d.log
+  License: C:\dev\License usage 2\rheinmetall\license.dat
+Lookback days (0 = entire log): [180]
 ```
 
-Useful flags:
+Press Enter to accept the bracketed defaults. The **last customer folder** you used successfully is remembered in `.last_data_folder` (local, gitignored). On a first run, the default is the folder containing `license_usage2.py` (where `rheinmetall/`, `Lanteris/`, etc. live).
 
-| Flag | Meaning |
-|---|---|
-| `--license_file PATH` | PTC `license.dat` for owned seat counts (default: `LICENSE_FILE`) |
-| `--html_file PATH` | Where to write the dashboard (default: `license_report.html` next to the script) |
-| `--no_browser` | Write HTML but do not open a browser |
-| `--lookup_file PATH` | Feature id → product name map (default: `license_lookup.txt`) |
-| `--prompt` | Interactive prompts instead of top-of-script defaults |
+Optional: `--no_browser` writes the HTML report without opening a browser.
 
-### Important defaults
+### Important defaults (top of script)
 
 | Setting | Meaning |
 |---|---|
-| `DEFAULT_LOG_FILE` | Path to `ptc_d.log` |
-| `LICENSE_FILE` | PTC `license.dat` / license pack; blank = do not load owned counts from a pack |
-| `DEFAULT_STATUS_FILE` | Optional `ptcstatus` dump; blank = skip |
+| `DEFAULT_LOOKBACK_DAYS` | Suggested lookback (180) |
+| `DEFAULT_REPORTING_DAYS` | `0` = entire log |
 | `DEFAULT_LICENSES` | Features to analyze, `\|`-separated; **blank = all features** |
-| `DEFAULT_LOOKBACK_DAYS` / `DEFAULT_REPORTING_DAYS` | `0` = entire log |
 | `DEFAULT_USERS` | `user@host` filter; blank = all users |
 | `DEFAULT_CAPACITY` | Optional `Feature=N\|Feature2=M` owned counts (overrides license.dat) |
-| `DEFAULT_LOOKUP_FILE` | Friendly names for feature ids |
 | `DEFAULT_HTML_FILE` | HTML dashboard output path |
 
-Owned-seat priority: `LICENSE_FILE` → status file → `--capacity` / `DEFAULT_CAPACITY` (later sources override). Duplicate `INCREMENT` lines for the same feature in `license.dat` are summed; `99999` bundle definitions are ignored.
+Owned-seat priority: `license.dat` → `DEFAULT_CAPACITY` (capacity overrides). Duplicate `INCREMENT` lines for the same feature in `license.dat` are summed; `99999` bundle definitions are ignored. Product display names come from the license-pack **summary table** (Product column) when readable; cryptic entries like `NOTEBOOK` / `PROCESS for MFG` fall back to `#Serviceable` / detail-table names.
 
 ### HTML dashboard
 
 After the text report, the script writes a self-contained webpage with:
 
 - KPI summary (features analyzed, ran-out count, under-used count, denial events)
-- Plain-language **key findings**
-- Features with **no usage in the report window** and **no owned count** from `license.dat` are omitted (legacy noise)
+- Plain-language **key findings** (includes **unique Creo users**, users on **more than one computer**, and **UNSUPPORTED** license requests in the lookback window; checkout or denial activity across all features)
+- Features with **no usage in the report window** and **no owned count** from `license.dat` are omitted; so are **numeric-only FlexLM IDs** (e.g. `308`) that are not defined in `license.dat` (old optional-module noise)
 - Doughnut chart of utilization outcomes
-- Bar charts for peak concurrent use, denials, and peak vs owned seats %
-- Per-feature cards with “what this means” text (uses `license_lookup.txt` for product names)
+- Bar chart for peak vs owned seats %
+- Per-feature cards with “what this means” text (product names from `license.dat`)
 
 Charts need network access once to load Chart.js from the CDN.
 
@@ -89,20 +88,19 @@ Charts need network access once to load Chart.js from the CDN.
 
 - **UTILIZATION** — clear wrapped label (`OVER-UTILIZED`, `UNDER-UTILIZED`, etc.)
 - **Meaning** — short plain-English takeaway per feature (text + HTML)
-- **Owned seats** — from `license.dat` when `LICENSE_FILE` is set (true counts). A **DENIED** means the pool was full at that moment.
-- **Ran out of licenses?** — `YES` only when saturation denials exist
+- **Owned seats** — from `license.dat` when present (true counts). A **DENIED** means the pool was full at that moment.
+- **Users checked out** — distinct `user@host` who got a seat at least once (`OUT` in the log)
+- **Users denied** — distinct `user@host` blocked at least once (one person retrying counts once)
 - Long text lines are wrapped to ~72 characters for readability
 
 ## Data files (local, usually gitignored)
 
 | File | Role |
 |---|---|
-| `ptc_d.log` / `ptc_d.log.*` | FlexLM vendor daemon log |
-| `license.dat` | Customer license pack (owned seat counts) |
-| `ptcstatus_output.txt` | Snapshot from `ptcstatus` (optional; may be sample/edited) |
+| `ptc_d.log` / `ptclmgrd.log` | FlexLM vendor daemon log (one per customer folder) |
+| `license.dat` | Customer license pack (owned seat counts + product names) |
 | `license_usage.csv` | Generated by live snapshot tooling if present |
 | `license_report.html` | Generated dashboard (regenerated each run) |
-| `license_lookup.txt` | Feature id / name → product name (kept in repo) |
 
 Do not commit large logs or generated status/CSV/HTML outputs (see `.gitignore`).
 
@@ -110,7 +108,6 @@ Do not commit large logs or generated status/CSV/HTML outputs (see `.gitignore`)
 
 ```
 license_usage2.py    # Log usage + denial report + HTML dashboard
-license_lookup.txt   # Feature → product name lookup
 .gitignore
 README.md
 ```

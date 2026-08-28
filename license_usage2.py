@@ -1,7 +1,7 @@
 """
 License utilization report.
 
-Tracks concurrent OUT/IN usage against owned seat counts from ptcstatus,
+Tracks concurrent OUT/IN usage against owned seat counts from license.dat,
 reports DENIED events where all seats were already in use, prints a text
 summary, and writes an HTML dashboard that opens in the browser.
 """
@@ -18,20 +18,8 @@ from collections import defaultdict
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Defaults — edit these so you can run the script with no prompts
+# Defaults — used when you press Enter at prompts (edit if you like)
 # ---------------------------------------------------------------------------
-# DEFAULT_LOG_FILE = r"C:\dev\License usage 2\ptc_d.log.big"
-
-# DEFAULT_LOG_FILE = r"C:\dev\License usage 2\rheinmetall\ptc_d.log"
-
-DEFAULT_LOG_FILE = r"C:\dev\License usage 2\lanteris\ptclmgrd.log"
-
-DEFAULT_STATUS_FILE = ""  # leave blank to ignore owned-seat file; usage-only report
-# PTC license.dat (or license pack export). Blank = do not load owned counts from a pack.
-# Same feature listed more than once is summed. Bundle defs with count 99999 are skipped.
-# LICENSE_FILE = r"C:\dev\License usage 2\rheinmetall\license.dat"
-LICENSE_FILE = r"C:\dev\License usage 2\lanteris\license.dat"
-
 # DEFAULT_LICENSES = "PROE_DesignEss"  # blank = report every feature found in the log
 DEFAULT_LICENSES = ""  # blank = report every feature found in the log
 DEFAULT_LOOKBACK_DAYS = 180   # 0 = entire log
@@ -40,8 +28,10 @@ DEFAULT_REPORTING_DAYS = 0  # 0 = entire log
 DEFAULT_USERS = ""
 # Optional: "PROE_DesignEss=10|10113=5" when you know real owned counts
 DEFAULT_CAPACITY = ""
-DEFAULT_LOOKUP_FILE = str(Path(__file__).resolve().parent / "license_lookup.txt")
 DEFAULT_HTML_FILE = str(Path(__file__).resolve().parent / "license_report.html")
+LAST_DATA_FOLDER_FILE = Path(__file__).resolve().parent / ".last_data_folder"
+# FlexLM vendor daemon logs — either name may appear in a customer folder.
+LOG_FILE_NAMES = ("ptc_d.log", "ptclmgrd.log")
 # ---------------------------------------------------------------------------
 
 TIMESTAMP_PATTERN = re.compile(r"TIMESTAMP\s+(\d{1,2}/\d{1,2}/\d{4})")
@@ -52,11 +42,30 @@ TIME_PATTERN = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2})")
 OUT_PATTERN = re.compile(r'OUT:\s+"([^"]+)"\s+(\S+)')
 IN_PATTERN = re.compile(r'IN:\s+"([^"]+)"\s+(\S+)')
 DENIED_PATTERN = re.compile(r'DENIED:\s+"([^"]+)"\s+(\S+)\s+\(([^)]*)\)')
-STATUS_LICENSE_PATTERN = re.compile(r"^\s*(\S+)\s+(\d+)\s+(\d+)\s*$")
+UNSUPPORTED_PATTERN = re.compile(
+    r'UNSUPPORTED:\s+"([^"]+)"\s+(?:\([^)]+\)\s+)?(\S+)\s+\(([^)]*)\)'
+)
 # INCREMENT feature daemon version expiry count ...
 INCREMENT_OWNED_PATTERN = re.compile(
     r"^INCREMENT\s+(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)\b"
 )
+SERVICEABLE_PATTERN = re.compile(r"^#\s*Serviceable\s*=\s*(.+)$", re.IGNORECASE)
+FEATURE_NAME_PATTERN = re.compile(r"^#\s*Feature Name\s*=\s*(\S+)", re.IGNORECASE)
+DETAIL_TABLE_PATTERN = re.compile(
+    r"^#\S+\s+(.+?)\s+SPN-\S+\s+.+\s+\d+\s+\d{4}-\d{2}-\d{2}\s+([\w,]+)\b"
+)
+SUMMARY_TABLE_ROW = re.compile(
+    r"^#(\S+)\s+\d+\s+(.+?)\s+(?:Creo|Prime)\s+\d+\.\d+\s+(?:Flt|Ext)\s+(?:Lic|Opt)\s+\d{1,2}-\w{3}-\d{4}",
+    re.IGNORECASE,
+)
+# Summary table uses internal FlexLM labels for some numeric features — keep #Serviceable instead.
+SUMMARY_SKIP_NAMES = frozenset({
+    "NOTEBOOK",
+    "VERIFY",
+    "TOOLKIT",
+    "TOOLKIT (> OR = 18.0)",
+    "PROCESS FOR MFG",
+})
 SERVER_STARTED_PATTERN = re.compile(r"Server started on")
 EXPIRED_PATTERN = re.compile(r"EXPIRED:\s+(\S+)")
 EXPIRES_WARNING_PATTERN = re.compile(
@@ -76,19 +85,193 @@ def get_input(prompt, default):
     return user_input if user_input else default
 
 
-def load_license_lookup(path):
-    """Load feature id/name → product name from license_lookup.txt."""
-    lookup = {}
-    if not path or not os.path.isfile(path):
-        return lookup
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+def default_data_folder():
+    """Folder suggested when you press Enter (last run, else this script's directory)."""
+    last = load_last_data_folder()
+    if last:
+        return last
+    return str(Path(__file__).resolve().parent)
+
+
+def customer_report_title(folder_path):
+    """Report heading from customer folder name, e.g. rheinmetall -> Rheinmetall."""
+    name = Path(folder_path).name.title()
+    return f"License Usage Report for {name}"
+
+
+def load_last_data_folder():
+    """Return the last successfully used customer folder, or None."""
+    try:
+        path = LAST_DATA_FOLDER_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not path:
+        return None
+    root = Path(path)
+    if root.is_dir():
+        return str(root.resolve())
+    return None
+
+
+def save_last_data_folder(folder):
+    """Remember customer folder for the next run."""
+    try:
+        root = Path(folder).expanduser()
+        if not root.is_absolute():
+            root = (Path.cwd() / root).resolve()
+        else:
+            root = root.resolve()
+        LAST_DATA_FOLDER_FILE.write_text(str(root) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def discover_ptc_files(folder):
+    """
+    Find license.dat and a FlexLM vendor log in a customer folder.
+
+    Looks for ptc_d.log and ptclmgrd.log; if both exist, uses the newest file.
+    """
+    root = Path(folder).expanduser()
+    if not root.is_absolute():
+        root = (Path.cwd() / root).resolve()
+    else:
+        root = root.resolve()
+
+    if not root.is_dir():
+        raise FileNotFoundError(f"Folder not found: {root}")
+
+    license_path = root / "license.dat"
+    license_file = str(license_path) if license_path.is_file() else None
+
+    log_paths = [root / name for name in LOG_FILE_NAMES if (root / name).is_file()]
+    if not log_paths:
+        raise FileNotFoundError(
+            f"No log in {root} (expected one of: {', '.join(LOG_FILE_NAMES)})"
+        )
+
+    log_path = max(log_paths, key=lambda p: p.stat().st_mtime)
+    if len(log_paths) > 1:
+        print(f"Note: multiple logs found; using newest: {log_path.name}")
+
+    return str(log_path), license_file
+
+
+def prompt_for_data_folder(default_folder=None):
+    """Ask for a customer folder and resolve log + license.dat inside it."""
+    default_folder = default_folder or default_data_folder()
+    while True:
+        folder = get_input(
+            "Customer folder (license.dat + ptc_d.log or ptclmgrd.log):",
+            default_folder,
+        )
+        try:
+            log_file, license_file = discover_ptc_files(folder)
+            save_last_data_folder(folder)
+            print(f"  Log:     {log_file}")
+            if license_file:
+                print(f"  License: {license_file}")
+            else:
+                print("  License: (not found — owned seats will be inferred only)")
+            return log_file, license_file
+        except FileNotFoundError as exc:
+            print(f"  {exc}")
+            print("  Try another folder.\n")
+
+
+def clean_product_name(name):
+    """Strip '(formerly ...)' and truncated summary-table parens like '(forme'."""
+    name = re.sub(r"\s*\(formerly[^)]*\)", "", name, flags=re.IGNORECASE)
+    # Truncated "(formerly ..." with no closing paren (fixed-width summary table)
+    name = re.sub(r"\s*\(formerly\b.*$", "", name, flags=re.IGNORECASE)
+    # Other truncated parens: "(forme", "(no PLM", "(AAX" cut off by column width
+    name = re.sub(r"\s*\([^)]*$", "", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def summary_name_usable(name):
+    """True when the summary-table Product column is a real name, not an internal alias."""
+    cleaned = clean_product_name(name)
+    if not cleaned:
+        return False
+    if cleaned.upper() in SUMMARY_SKIP_NAMES:
+        return False
+    if cleaned.upper().startswith("PROCESS FOR MFG"):
+        return False
+    return True
+
+
+def merge_display_names(block_names, summary_names):
+    """Prefer summary-table names except for cryptic internal aliases (NOTEBOOK, etc.)."""
+    merged = dict(block_names)
+    for feature, raw_name in summary_names.items():
+        if not summary_name_usable(raw_name):
+            continue
+        merged[feature] = clean_product_name(raw_name)
+    return merged
+
+
+def parse_license_dat(license_file):
+    """
+    Parse PTC license.dat for owned seat counts and feature display names.
+
+    Names: license-pack summary table (Product column) when readable, else
+    #Serviceable / #Feature Name blocks, with the detail table as fallback
+    (e.g. 10113,PROBUNDLE_10113). Duplicate INCREMENT rows are summed;
+    bundle defs with count 99999 are skipped.
+    """
+    owned = defaultdict(int)
+    names = {}
+    summary_names = {}
+    current_serviceable = None
+    in_summary_table = False
+
+    with open(license_file, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
+            stripped = line.lstrip()
+
+            if stripped.startswith("#") and "Summary Table" in stripped:
+                in_summary_table = True
                 continue
-            key, value = line.split("=", 1)
-            lookup[key.strip()] = value.strip()
-    return lookup
+            if stripped.startswith("#") and "Detail Table" in stripped:
+                in_summary_table = False
+                continue
+
+            if in_summary_table:
+                summary_match = SUMMARY_TABLE_ROW.match(stripped)
+                if summary_match:
+                    summary_names[summary_match.group(1)] = summary_match.group(2)
+                continue
+
+            serviceable_match = SERVICEABLE_PATTERN.match(stripped)
+            if serviceable_match:
+                current_serviceable = clean_product_name(serviceable_match.group(1))
+                continue
+
+            feature_match = FEATURE_NAME_PATTERN.match(stripped)
+            if feature_match and current_serviceable:
+                names[feature_match.group(1)] = current_serviceable
+                continue
+
+            detail_match = DETAIL_TABLE_PATTERN.match(stripped)
+            if detail_match:
+                product_name = clean_product_name(detail_match.group(1))
+                for feature in detail_match.group(2).split(","):
+                    feature = feature.strip()
+                    if feature and feature not in names:
+                        names[feature] = product_name
+                continue
+
+            increment_match = INCREMENT_OWNED_PATTERN.match(stripped)
+            if not increment_match:
+                continue
+            name, count_s = increment_match.groups()
+            count = int(count_s)
+            if count >= BUNDLE_PLACEHOLDER_COUNT:
+                continue
+            owned[name] += count
+
+    return dict(owned), merge_display_names(names, summary_names)
 
 
 def display_name(feature, lookup):
@@ -108,50 +291,9 @@ def normalize_user(user):
     return user.casefold()
 
 
-def parse_owned_seats(status_file):
-    """Parse ptcstatus output. Owned seats = In Use + Free."""
-    owned = {}
-    in_section = False
-
-    with open(status_file, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if "License    In Use   Free" in line:
-                in_section = True
-                continue
-            if not in_section:
-                continue
-            if line.strip().startswith("(") or not line.strip():
-                continue
-            if line.strip().startswith("*") or line.strip().startswith("^"):
-                break
-
-            match = STATUS_LICENSE_PATTERN.match(line)
-            if match:
-                name, in_use, free = match.groups()
-                owned[name] = int(in_use) + int(free)
-
-    return owned
-
-
-def parse_license_dat(license_file):
-    """
-    Parse PTC license.dat INCREMENT lines for owned seat counts.
-
-    If the same feature appears more than once, counts are summed.
-    Bundle definition rows with count 99999 are skipped.
-    """
-    owned = defaultdict(int)
-    with open(license_file, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            match = INCREMENT_OWNED_PATTERN.match(line.lstrip())
-            if not match:
-                continue
-            name, count_s = match.groups()
-            count = int(count_s)
-            if count >= BUNDLE_PLACEHOLDER_COUNT:
-                continue
-            owned[name] += count
-    return dict(owned)
+def normalize_username(user):
+    """Username before @, case-insensitive — same person on two PCs counts once."""
+    return normalize_user(user).split("@", 1)[0]
 
 
 def parse_capacity_override(text):
@@ -173,7 +315,7 @@ def parse_capacity_override(text):
 class FeatureStats:
     def __init__(self, name, owned):
         self.name = name
-        self.owned = owned  # explicit override from config/status, if any
+        self.owned = owned  # explicit override from license.dat / capacity, if any
         self.concurrent = 0  # unique user@host currently holding a seat (case-insensitive)
         self.holders = defaultdict(int)  # normalized user@host -> open checkout count
         self.peak_overall = 0
@@ -221,7 +363,7 @@ class FeatureStats:
         """
         Resolve owned seat count.
 
-        Prefer explicit owned from license.dat / status / capacity. Otherwise
+        Prefer explicit owned from license.dat / capacity. Otherwise
         infer from denials and peak: successful concurrent checkouts cannot
         exceed owned seats, so owned >= historical peak. A saturation DENIED
         means the pool was full at that moment.
@@ -230,7 +372,7 @@ class FeatureStats:
             return {
                 "count": self.owned,
                 "confidence": "owned",
-                "detail": "from LICENSE_FILE (license.dat) / status file / DEFAULT_CAPACITY / --capacity",
+                "detail": "",
                 "lower_bound": self.owned,
                 "at_denial": None,
                 "note": None,
@@ -355,6 +497,8 @@ def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0
     current_date = None
     current_time_str = None
     line_no = 0
+    unsupported_count = 0
+    last_unsupported_key = None
 
     with open(log_file, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -470,8 +614,26 @@ def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0
                     s.denial_users[user_key] += 1
                     # DENIED => pool full => holders in use = owned seats
                     s.denial_holder_samples.append(s.concurrent)
+                continue
 
-    return stats, line_no
+            unsupported_match = UNSUPPORTED_PATTERN.search(line)
+            if unsupported_match:
+                feature, user, _reason = unsupported_match.groups()
+                user_key = normalize_user(user)
+                if user_set is not None and user_key not in user_set:
+                    continue
+                if not in_report_window(
+                    current_date, now, lookback_days, reporting_days
+                ):
+                    continue
+                unsupported_key = (
+                    current_date, current_time_str, feature, user_key
+                )
+                if unsupported_key != last_unsupported_key:
+                    last_unsupported_key = unsupported_key
+                    unsupported_count += 1
+
+    return stats, line_no, unsupported_count
 
 
 def classify_feature(s):
@@ -573,12 +735,16 @@ def had_window_usage(s):
     )
 
 
-def include_in_report(s):
+def include_in_report(s, lookup=None):
     """
     Keep features that were used in the window, or that have a known owned
-    count from license.dat / status / capacity. Drop noise like legacy
-    features seen only outside the window with no owned seats.
+    count from license.dat / capacity. Drop noise like legacy
+    features seen only outside the window with no owned seats, and pure-numeric
+    optional-module IDs (308, 301, …) that are not in license.dat.
     """
+    lookup = lookup or {}
+    if s.name.isdigit() and s.name not in lookup:
+        return False
     if had_window_usage(s):
         return True
     if s.owned is not None:
@@ -587,7 +753,7 @@ def include_in_report(s):
 
 
 def plain_meaning(s, label, lookup):
-    """One short paragraph a non-expert can act on."""
+    """One short paragraph a non-expert can act on (no stats duplicated from metrics)."""
     name = display_name(s.name, lookup)
     pred = s.predict_owned_seats()
     bucket = status_bucket(label)
@@ -598,56 +764,122 @@ def plain_meaning(s, label, lookup):
             f"they look unused here — or this feature simply was not needed."
         )
     if bucket == "over":
-        owned_bit = ""
-        if pred["count"] is not None:
-            if pred["confidence"] == "owned":
-                owned_bit = f" Owned seats: {pred['count']}."
-            else:
-                owned_bit = (
-                    f" Inferred pool size: about {pred['count']} seat(s) "
-                    f"(from denials / peak evidence)."
-                )
+        denial_days = len(s.denial_by_day)
+        if denial_days <= 2:
+            rarity = "rare"
+        elif denial_days <= 10:
+            rarity = "occasional"
+        else:
+            rarity = "repeated"
+        extra = f" {pred['note']}" if pred.get("note") else ""
         return (
-            f"{name} ran out of seats. FlexLM blocked people "
-            f"{s.denial_events} time(s) on {len(s.denial_by_day)} day(s). "
-            f"Peak simultaneous users: {s.peak_overall}.{owned_bit} "
-            f"Meaning: demand exceeded supply — consider more seats or "
-            f"staggering who uses this option."
+            f"{name} ran out of seats ({rarity} shortage). "
+            f"Demand exceeded supply — consider more seats or "
+            f"staggering who uses this option.{extra}"
         )
     if bucket == "under":
-        cap = pred["count"]
-        spare = (cap - s.peak_overall) if cap else None
-        spare_bit = f" About {spare} seat(s) sat unused even at the busiest moment." if spare else ""
         return (
-            f"{name} never ran out. Peak was {s.peak_overall} concurrent user(s)"
-            f"{f' of {cap} owned' if cap else ''}.{spare_bit} "
-            f"Meaning: capacity looks comfortable for this window."
+            f"{name} never ran out. Peak stayed below owned capacity with no denials. "
+            f"Capacity looks comfortable for this window."
         )
     if bucket == "full":
         return (
-            f"{name} hit peak equal to owned capacity ({s.peak_overall}), "
-            f"but nobody was denied. Meaning: fully used at times, yet the "
-            f"pool still covered demand — watch this one if usage grows."
+            f"{name} hit peak equal to owned capacity, but nobody was denied. "
+            f"Fully used at times, yet the pool still covered demand — watch if usage grows."
         )
     return (
-        f"{name} peaked at {s.peak_overall} concurrent user(s) with no denials. "
-        f"Meaning: no proof of shortage; exact owned count unknown without "
-        f"denials or a configured capacity."
+        f"{name} peaked with no denials. No proof of shortage; exact owned count "
+        f"unknown without denials or a configured capacity."
     )
 
 
 def ordered_features(stats):
+    # After PROE_ base licenses: FULLY → other used (OVER/UNDER/…) → UNUSED
+    bucket_rank = {
+        "full": 0,
+        "over": 1,
+        "under": 2,
+        "unknown": 3,
+        "unused": 4,
+    }
+
     def sort_key(s):
         label, _ = classify_feature(s)
-        over = 0 if "OVER" in label else 1
-        return (over, -s.denial_events, -s.peak_overall, -s.out_count, s.name)
+        base = 0 if s.name.startswith("PROE_") else 1
+        rank = bucket_rank.get(status_bucket(label), 3)
+        return (base, rank, -s.denial_events, -s.peak_overall, -s.out_count, s.name)
 
     return sorted(stats.values(), key=sort_key)
 
 
-def build_executive_summary(stats, lookup):
+def unique_creo_users(stats, lookup=None):
+    """People (username) who checked out or were denied any reported feature."""
+    users = set()
+    for s in stats.values():
+        if not include_in_report(s, lookup):
+            continue
+        for user_host in s.users_seen:
+            users.add(normalize_username(user_host))
+        for user_host in s.denial_users:
+            users.add(normalize_username(user_host))
+    return users
+
+
+def creo_hosts_by_user(stats, lookup=None):
+    """Map username → distinct computers (host part of user@host) with Creo activity."""
+    hosts_by_user = defaultdict(set)
+    for s in stats.values():
+        if not include_in_report(s, lookup):
+            continue
+        for user_host in s.users_seen:
+            _record_user_host(hosts_by_user, user_host)
+        for user_host in s.denial_users:
+            _record_user_host(hosts_by_user, user_host)
+    return hosts_by_user
+
+
+def _record_user_host(hosts_by_user, user_host):
+    folded = normalize_user(user_host)
+    if "@" not in folded:
+        return
+    user, host = folded.split("@", 1)
+    hosts_by_user[user].add(host)
+
+
+def multi_computer_creo_users(stats, lookup=None):
+    """Usernames that checked out or were denied from more than one computer."""
+    return {
+        user: hosts
+        for user, hosts in creo_hosts_by_user(stats, lookup).items()
+        if len(hosts) > 1
+    }
+
+
+def window_phrase(lookback_days=0, reporting_days=0):
+    if lookback_days > 0:
+        return f"in the last {lookback_days} days"
+    if reporting_days > 0:
+        return f"in the last {reporting_days} days"
+    return "in the log"
+
+
+def format_window_label(lookback_days=0, reporting_days=0):
+    """Report window line; omit reporting when 0."""
+    if lookback_days <= 0 and reporting_days <= 0:
+        return "entire log"
+    parts = []
+    if lookback_days > 0:
+        parts.append(f"lookback={lookback_days}d")
+    if reporting_days > 0:
+        parts.append(f"reporting={reporting_days}d")
+    return ", ".join(parts)
+
+
+def build_executive_summary(
+    stats, lookup, lookback_days=0, reporting_days=0, unsupported_count=0
+):
     """Short bullets for the top of the HTML report."""
-    ordered = [s for s in ordered_features(stats) if include_in_report(s)]
+    ordered = [s for s in ordered_features(stats) if include_in_report(s, lookup)]
     counts = defaultdict(int)
     total_denials = 0
     for s in ordered:
@@ -660,6 +892,33 @@ def build_executive_summary(stats, lookup):
     bullets.append(
         f"Analyzed {n} license feature(s) from the FlexLM log."
     )
+    creo_users = unique_creo_users(stats, lookup)
+    if creo_users:
+        if lookback_days > 0:
+            window_txt = f"in the last {lookback_days} days"
+        elif reporting_days > 0:
+            window_txt = f"in the last {reporting_days} days"
+        else:
+            window_txt = "in the log"
+        bullets.append(
+            f"{len(creo_users):,} unique Creo users {window_txt}."
+        )
+        multi_pc = multi_computer_creo_users(stats, lookup)
+        if multi_pc:
+            bullets.append(
+                f"{len(multi_pc)} user(s) used Creo from more than one computer "
+                f"{window_txt}."
+            )
+    else:
+        bullets.append(
+            f"No Creo license activity recorded {window_phrase(lookback_days, reporting_days)}."
+        )
+    if unsupported_count:
+        bullets.append(
+            f"{unsupported_count:,} UNSUPPORTED license request(s) "
+            f"{window_phrase(lookback_days, reporting_days)} "
+            f"(feature not served by this license server)."
+        )
     if counts["over"]:
         names = [
             display_name(s.name, lookup)
@@ -727,7 +986,7 @@ def _kv(label, value, label_width=18):
     print(_wrap(value, indent=4))
 
 
-def print_report(stats, lookback_days, reporting_days, status_file, log_file, lines_read,
+def print_report(stats, lookback_days, reporting_days, log_file, lines_read,
                  user_computers=None, lookup=None, license_file=None):
     lookup = lookup or {}
     _hr("=")
@@ -737,15 +996,10 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
     print()
     _kv("Log", log_file)
     _kv("License.dat", license_file or "(not used)")
-    _kv("Status", status_file or "(not used)")
     _kv("Lines", f"{lines_read:,}")
-    ordered = [s for s in ordered_features(stats) if include_in_report(s)]
-    skipped = len(stats) - len(ordered)
-    _kv("Features", len(ordered) if not skipped else f"{len(ordered)}  ({skipped} hidden: no usage, no owned)")
-    if lookback_days or reporting_days:
-        _kv("Window", f"lookback={lookback_days}, reporting={reporting_days}")
-    else:
-        _kv("Window", "entire log")
+    ordered = [s for s in ordered_features(stats) if include_in_report(s, lookup)]
+    _kv("Features", len(ordered))
+    _kv("Window", format_window_label(lookback_days, reporting_days))
     if user_computers:
         print(_wrap("Users: " + ", ".join(user_computers), indent=2))
     else:
@@ -764,7 +1018,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
         avg_daily_peak = (
             sum(s.daily_peak.values()) / len(s.daily_peak) if s.daily_peak else 0
         )
-        label, explanation = classify_feature(s)
+        label, _ = classify_feature(s)
         pred = s.predict_owned_seats()
         title = display_name(s.name, lookup)
         subtitle = s.name if title != s.name else None
@@ -778,9 +1032,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
         print()
         print(f"  >>> {label}")
         print()
-        print(_wrap(explanation, indent=2))
-        print()
-        print(_wrap("Meaning: " + plain_meaning(s, label, lookup), indent=2))
+        print(_wrap(plain_meaning(s, label, lookup), indent=2))
         print()
 
         print("  Owned seats")
@@ -794,7 +1046,8 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
                 )
         else:
             _kv("Exact count", f"unknown (at least {pred['lower_bound']})")
-        print(_wrap(pred["detail"], indent=4))
+        if pred["detail"]:
+            print(_wrap(pred["detail"], indent=4))
         if pred.get("at_denial") is not None and pred["at_denial"] != pred["count"]:
             _kv("In use at DENIED", pred["at_denial"])
             print(_wrap(
@@ -824,7 +1077,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
             ))
         _kv("Avg daily peak", f"{avg_daily_peak:.1f}")
         _kv("Active days", len(s.daily_peak))
-        _kv("Distinct users", len(s.users_seen))
+        _kv("Users checked out", len(s.users_seen))
         _kv("OUT / IN", f"{s.out_count:,} / {s.in_count:,}")
         print()
 
@@ -834,6 +1087,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
         else:
             _kv("Answer", "NO — no saturation denials in this window")
         _kv("Events", f"{s.denial_events}  ({s.denial_raw} raw log lines)")
+        _kv("Users denied", len(s.denial_users))
         _kv("Days with denials", len(s.denial_by_day))
         print()
 
@@ -872,7 +1126,7 @@ def print_report(stats, lookback_days, reporting_days, status_file, log_file, li
     print()
     print("Notes")
     print(_wrap(
-        "Owned seats come from LICENSE_FILE (license.dat) when set. "
+        "Owned seats come from license.dat when present. "
         "Otherwise they may be inferred from denials: owned is at least the "
         "peak concurrent checkouts that succeeded. DENIED means the pool was "
         "full then; if in-use at DENIED is lower than peak, capacity changed "
@@ -886,25 +1140,24 @@ def write_html_report(
     stats,
     lookback_days,
     reporting_days,
-    status_file,
     log_file,
     lines_read,
     html_path,
     user_computers=None,
     lookup=None,
     license_file=None,
+    unsupported_count=0,
 ):
     """Write a self-contained HTML dashboard and return its path."""
     lookup = lookup or {}
-    ordered = [s for s in ordered_features(stats) if include_in_report(s)]
-    skipped = len(stats) - len(ordered)
-    bullets, status_counts, total_denials = build_executive_summary(stats, lookup)
+    ordered = [s for s in ordered_features(stats) if include_in_report(s, lookup)]
+    bullets, status_counts, total_denials = build_executive_summary(
+        stats, lookup, lookback_days, reporting_days, unsupported_count
+    )
     generated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    if lookback_days or reporting_days:
-        window = f"lookback={lookback_days}d, reporting={reporting_days}d"
-    else:
-        window = "entire log"
+    window = format_window_label(lookback_days, reporting_days)
+    data_folder = str(Path(log_file).resolve().parent)
+    report_title = customer_report_title(data_folder)
 
     # Chart data
     status_labels = [
@@ -931,22 +1184,6 @@ def write_html_report(
             pie_values.append(n)
             pie_color_list.append(pie_colors[key])
 
-    # Peak / denial bars — top features by activity
-    chart_features = [
-        s for s in ordered
-        if s.peak_overall > 0 or s.denial_events > 0 or s.out_count > 0
-    ][:20]
-    peak_labels = [display_name(s.name, lookup) for s in chart_features]
-    peak_values = [s.peak_overall for s in chart_features]
-    owned_values = []
-    for s in chart_features:
-        pred = s.predict_owned_seats()
-        owned_values.append(pred["count"] if pred["count"] is not None else None)
-
-    denial_features = [s for s in ordered if s.denial_events > 0][:15]
-    denial_labels = [display_name(s.name, lookup) for s in denial_features]
-    denial_values = [s.denial_events for s in denial_features]
-
     # Utilization % where owned known — bar color matches card status (OVER = denials)
     util_labels = []
     util_values = []
@@ -972,7 +1209,7 @@ def write_html_report(
 
     feature_cards = []
     for s in ordered:
-        label, explanation = classify_feature(s)
+        label, _ = classify_feature(s)
         pred = s.predict_owned_seats()
         bucket = status_bucket(label)
         avg_daily_peak = (
@@ -993,17 +1230,16 @@ def write_html_report(
             "title": display_name(s.name, lookup),
             "bucket": bucket,
             "label": label,
-            "explanation": explanation,
             "meaning": plain_meaning(s, label, lookup),
             "peak": s.peak_overall,
             "peak_when": peak_when,
             "avg_daily_peak": round(avg_daily_peak, 1),
-            "active_days": len(s.daily_peak),
             "users": len(s.users_seen),
             "out": s.out_count,
             "inn": s.in_count,
             "denials": s.denial_events,
             "denial_days": len(s.denial_by_day),
+            "unique_denied": len(s.denial_users),
             "owned": pred["count"],
             "owned_lower": pred["lower_bound"],
             "owned_confidence": pred["confidence"],
@@ -1017,11 +1253,6 @@ def write_html_report(
         "pieLabels": pie_labels,
         "pieValues": pie_values,
         "pieColors": pie_color_list,
-        "peakLabels": peak_labels,
-        "peakValues": peak_values,
-        "ownedValues": owned_values,
-        "denialLabels": denial_labels,
-        "denialValues": denial_values,
         "utilLabels": util_labels,
         "utilValues": util_values,
         "utilColors": util_colors,
@@ -1046,33 +1277,39 @@ def write_html_report(
             peak_pct = f" — {100.0 * card['peak'] / card['owned']:.0f}% of owned"
 
         days_rows = "".join(
-            f"<li><span>{esc(d)}</span><strong>{p}</strong></li>"
+            f"<tr><td>{esc(d)}</td><td class=\"num\">{p}</td></tr>"
             for d, p in card["top_days"]
         )
         denial_rows = "".join(
-            f"<li><span>{esc(d)}</span><strong>{c}</strong></li>"
+            f"<tr><td>{esc(d)}</td><td class=\"num\">{c}</td></tr>"
             for d, c in card["top_denial_days"]
         )
         user_rows = "".join(
-            f"<li><span>{esc(u)}</span><strong>{c}</strong></li>"
+            f"<tr><td>{esc(u)}</td><td class=\"num\">{c}</td></tr>"
             for u, c in card["top_users"]
         )
 
         side_blocks = []
         if days_rows:
             side_blocks.append(
-                f'<div class="mini"><h4>Busiest days (peak concurrent)</h4>'
-                f'<ul class="kv">{days_rows}</ul></div>'
+                f'<div class="mini"><h4>Busiest days</h4>'
+                f'<table class="mini-table"><thead><tr>'
+                f'<th>Day</th><th class="num">Peak</th></tr></thead>'
+                f'<tbody>{days_rows}</tbody></table></div>'
             )
         if denial_rows:
             side_blocks.append(
-                f'<div class="mini"><h4>Days people were blocked</h4>'
-                f'<ul class="kv">{denial_rows}</ul></div>'
+                f'<div class="mini"><h4>Days blocked</h4>'
+                f'<table class="mini-table"><thead><tr>'
+                f'<th>Day</th><th class="num">Blocks</th></tr></thead>'
+                f'<tbody>{denial_rows}</tbody></table></div>'
             )
         if user_rows:
             side_blocks.append(
-                f'<div class="mini"><h4>Users denied most often</h4>'
-                f'<ul class="kv">{user_rows}</ul></div>'
+                f'<div class="mini"><h4>Most denied users</h4>'
+                f'<table class="mini-table"><thead><tr>'
+                f'<th>User</th><th class="num">Times</th></tr></thead>'
+                f'<tbody>{user_rows}</tbody></table></div>'
             )
         side = "".join(side_blocks)
 
@@ -1086,28 +1323,24 @@ def write_html_report(
     <span class="badge badge-{esc(card['bucket'])}">{esc(card['label'])}</span>
   </header>
   <p class="meaning"><strong>What this means:</strong> {esc(card['meaning'])}</p>
-  <p class="detail">{esc(card['explanation'])}</p>
   <div class="metrics">
     <div><span>Peak concurrent</span><strong>{card['peak']}{esc(peak_pct)}</strong></div>
     <div><span>Owned seats</span><strong>{esc(owned_txt)}</strong></div>
     <div><span>Denial events</span><strong>{card['denials']}</strong></div>
-    <div><span>Distinct users</span><strong>{card['users']}</strong></div>
-    <div><span>Active days</span><strong>{card['active_days']}</strong></div>
+    <div><span>Users denied</span><strong>{card['unique_denied']}</strong></div>
+    <div><span>Users checked out</span><strong>{card['users']}</strong></div>
     <div><span>Avg daily peak</span><strong>{card['avg_daily_peak']}</strong></div>
   </div>
   {"<p class='muted'>Peak when: " + esc(card['peak_when']) + "</p>" if card['peak_when'] else ""}
-  <p class="muted">{esc(card['owned_detail'])}</p>
+  {"<p class='muted'>" + esc(card['owned_detail']) + "</p>" if card['owned_detail'] else ""}
   <div class="side-grid">{side}</div>
 </article>
 """)
 
     bullets_html = "".join(f"<li>{esc(b)}</li>" for b in bullets)
-    users_txt = ", ".join(user_computers) if user_computers else "all users"
     chart_json = json.dumps(chart_payload)
 
-    show_denial_chart = "true" if denial_values else "false"
     show_util_chart = "true" if util_values else "false"
-    show_peak_chart = "true" if peak_values else "false"
     show_pie = "true" if pie_values else "false"
 
     page = f"""<!DOCTYPE html>
@@ -1115,7 +1348,7 @@ def write_html_report(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>License Usage Report</title>
+<title>{esc(report_title)}</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 <style>
 :root {{
@@ -1151,16 +1384,10 @@ header.hero {{
   border-bottom: 1px solid var(--line);
 }}
 header.hero h1 {{
-  margin: 0 0 6px;
+  margin: 0 0 14px;
   font-size: 1.85rem;
   letter-spacing: -0.02em;
   color: var(--accent);
-}}
-header.hero .tagline {{
-  margin: 0 0 14px;
-  font-size: 1.05rem;
-  color: var(--muted);
-  max-width: 42rem;
 }}
 .meta {{
   display: flex; flex-wrap: wrap; gap: 10px 18px;
@@ -1202,6 +1429,7 @@ section.panel h2 {{
   grid-template-columns: 1fr 1.2fr;
   gap: 18px;
   margin-bottom: 18px;
+  min-width: 0;
 }}
 @media (max-width: 860px) {{
   .charts {{ grid-template-columns: 1fr; }}
@@ -1211,10 +1439,16 @@ section.panel h2 {{
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 16px 18px;
+  min-width: 0;
 }}
 .chart-card h2 {{ margin: 0 0 4px; font-size: 1.05rem; }}
 .chart-card .caption {{ margin: 0 0 12px; font-size: 0.85rem; color: var(--muted); }}
-.chart-wrap {{ position: relative; height: 280px; }}
+.chart-wrap {{
+  position: relative;
+  height: 280px;
+  width: 100%;
+  min-width: 0;
+}}
 .chart-wrap.tall {{ height: 340px; }}
 .legend-note {{
   font-size: 0.85rem;
@@ -1254,13 +1488,12 @@ section.panel h2 {{
 .badge-unused {{ background: #eeebe6; color: var(--unused); }}
 .badge-unknown {{ background: #fff3d6; color: #7a5c00; }}
 .meaning {{
-  margin: 12px 0 8px;
+  margin: 12px 0 12px;
   padding: 10px 12px;
   background: #f3f7f5;
   border-radius: 8px;
   border: 1px solid #d5e4dc;
 }}
-.detail {{ margin: 0 0 12px; color: var(--muted); font-size: 0.95rem; }}
 .metrics {{
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -1277,49 +1510,62 @@ section.panel h2 {{
 .metrics strong {{ font-size: 0.95rem; font-variant-numeric: tabular-nums; }}
 .muted {{ color: var(--muted); font-size: 0.88rem; margin: 6px 0; }}
 .side-grid {{
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
   margin-top: 10px;
 }}
+.mini {{
+  flex: 0 1 auto;
+  min-width: 11rem;
+  max-width: 20rem;
+}}
 .mini h4 {{ margin: 0 0 6px; font-size: 0.82rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.03em; }}
-.kv {{ list-style: none; margin: 0; padding: 0; }}
-.kv li {{
-  display: flex; justify-content: space-between; gap: 8px;
-  padding: 3px 0; border-bottom: 1px solid #edf1f4;
+.mini-table {{
+  width: 100%;
+  border-collapse: collapse;
   font-size: 0.88rem;
 }}
-.guide {{
-  font-size: 0.92rem;
+.mini-table th {{
+  text-align: left;
+  font-size: 0.72rem;
   color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0 0 4px;
+  border-bottom: 1px solid var(--line);
 }}
-.guide dt {{ font-weight: 600; color: var(--ink); margin-top: 8px; }}
-.guide dd {{ margin: 2px 0 0; }}
-footer.note {{
-  margin-top: 28px;
-  font-size: 0.85rem;
-  color: var(--muted);
+.mini-table th.num {{
+  text-align: right;
+  width: 3.5rem;
+  padding-left: 12px;
 }}
+.mini-table td {{
+  padding: 5px 0;
+  border-bottom: 1px solid #edf1f4;
+  vertical-align: top;
+}}
+.mini-table td.num {{
+  text-align: right;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  width: 3.5rem;
+  padding-left: 12px;
+  white-space: nowrap;
+}}
+.mini-table tbody tr:last-child td {{ border-bottom: none; }}
 .hidden {{ display: none !important; }}
 </style>
 </head>
 <body>
 <div class="wrap">
   <header class="hero">
-    <h1>License Usage Report</h1>
-    <p class="tagline">
-      Did we run out of seats, or are we sitting on spare capacity?
-      Charts and plain-language findings from your FlexLM / PTC log.
-    </p>
+    <h1>{esc(report_title)}</h1>
     <div class="meta">
       <div><strong>Generated</strong> {esc(generated)}</div>
-      <div><strong>Log</strong> {esc(log_file)}</div>
-      <div><strong>Lines</strong> {lines_read:,}</div>
-      <div><strong>Features</strong> {len(ordered)}{f" ({skipped} hidden)" if skipped else ""}</div>
+      <div><strong>Folder</strong> {esc(data_folder)}</div>
       <div><strong>Window</strong> {esc(window)}</div>
-      <div><strong>Users</strong> {esc(users_txt)}</div>
-      <div><strong>License.dat</strong> {esc(license_file or "not used")}</div>
-      <div><strong>Status file</strong> {esc(status_file or "not used")}</div>
     </div>
   </header>
 
@@ -1350,58 +1596,49 @@ footer.note {{
     </div>
   </div>
 
-  <div class="chart-card {'hidden' if not peak_values else ''}" style="margin-bottom:18px">
-    <h2>Peak concurrent users by feature</h2>
-    <p class="caption">Highest number of unique user@host holders at once, next to owned seats from license.dat when known.</p>
-    <div class="chart-wrap tall"><canvas id="barPeak"></canvas></div>
-  </div>
-
-  <div class="chart-card {'hidden' if not denial_values else ''}" style="margin-bottom:18px">
-    <h2>Where people were blocked</h2>
-    <p class="caption">Saturation denial events (retries collapsed). Higher = more times someone could not get a seat.</p>
-    <div class="chart-wrap"><canvas id="barDenials"></canvas></div>
-  </div>
-
-  <section class="panel">
-    <h2>How to read this</h2>
-    <dl class="guide">
-      <dt>Ran out (OVER)</dt>
-      <dd>FlexLM logged DENIED because all seats were already in use. Real users were blocked. Peak can equal owned (100%) and still be OVER if denials occurred.</dd>
-      <dt>Spare capacity (UNDER)</dt>
-      <dd>Peak concurrent use stayed below owned seats, and nobody was denied.</dd>
-      <dt>Full but no denials</dt>
-      <dd>Peak hit the owned count, but the pool still covered demand — watch if usage grows.</dd>
-      <dt>Owned seats</dt>
-      <dd>Taken from LICENSE_FILE (license.dat) — true purchased counts. Duplicate INCREMENT rows for the same feature are summed. Status/--capacity can override. If no license.dat, counts may be inferred from denials/peak.</dd>
-      <dt>What gets listed</dt>
-      <dd>Features with usage in the report window, or a known owned count from license.dat. Features with neither are hidden.</dd>
-      <dt>Same user@host = 1 seat</dt>
-      <dd>One person launching Creo twice on the same computer still counts as one concurrent seat. Username casing differences (rbrock vs RBROCK) are treated as the same holder.</dd>
-    </dl>
-  </section>
-
-  <h2 style="margin: 8px 0 12px; font-size: 1.2rem;">Feature details</h2>
+  <h2 style="margin: 8px 0 12px; font-size: 1.2rem;">Usage details</h2>
   {"".join(card_html_parts)}
 
-  <footer class="note">
-    Owned seats come from license.dat when LICENSE_FILE is set. DENIED means the pool was full at that moment.
-    Source: {esc(os.path.basename(log_file))} · {esc(generated)}
-  </footer>
 </div>
 <script>
 const DATA = {chart_json};
 const SHOW = {{
   pie: {show_pie},
-  peak: {show_peak_chart},
-  denial: {show_denial_chart},
   util: {show_util_chart}
 }};
 
 Chart.defaults.font.family = '"Segoe UI", "Helvetica Neue", sans-serif';
 Chart.defaults.color = '#5a6a78';
+Chart.defaults.animation = false;
+
+function yAxisLabelWidth(scale, labels) {{
+  const ctx = scale.chart.ctx;
+  const font = Chart.defaults.font;
+  ctx.save();
+  ctx.font = `${{font.size}}px ${{font.family}}`;
+  let max = 0;
+  for (const label of labels) {{
+    max = Math.max(max, ctx.measureText(String(label)).width);
+  }}
+  ctx.restore();
+  const needed = Math.ceil(max) + 16;
+  const budget = Math.floor(scale.chart.width * 0.48);
+  return Math.min(needed, Math.max(120, budget));
+}}
+
+function watchChartResize(chart, container) {{
+  if (!window.ResizeObserver) {{
+    return;
+  }}
+  const ro = new ResizeObserver(() => {{
+    chart.resize();
+  }});
+  ro.observe(container);
+}}
 
 if (SHOW.pie && document.getElementById('pieStatus')) {{
-  new Chart(document.getElementById('pieStatus'), {{
+  const pieCanvas = document.getElementById('pieStatus');
+  const pieChart = new Chart(pieCanvas, {{
     type: 'doughnut',
     data: {{
       labels: DATA.pieLabels,
@@ -1428,79 +1665,15 @@ if (SHOW.pie && document.getElementById('pieStatus')) {{
       }}
     }}
   }});
-}}
-
-if (SHOW.peak && document.getElementById('barPeak')) {{
-  new Chart(document.getElementById('barPeak'), {{
-    type: 'bar',
-    data: {{
-      labels: DATA.peakLabels,
-      datasets: [
-        {{
-          label: 'Peak concurrent users',
-          data: DATA.peakValues,
-          backgroundColor: '#0b6e4f',
-          borderRadius: 4
-        }},
-        {{
-          label: 'Owned seats',
-          data: DATA.ownedValues,
-          backgroundColor: '#e67e22',
-          borderRadius: 4
-        }}
-      ]
-    }},
-    options: {{
-      indexAxis: 'y',
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {{
-        x: {{
-          title: {{ display: true, text: 'Concurrent unique user@host' }},
-          beginAtZero: true,
-          ticks: {{ precision: 0 }}
-        }},
-        y: {{
-          ticks: {{ autoSkip: false, font: {{ size: 11 }} }}
-        }}
-      }},
-      plugins: {{
-        legend: {{ position: 'bottom' }}
-      }}
-    }}
-  }});
-}}
-
-if (SHOW.denial && document.getElementById('barDenials')) {{
-  new Chart(document.getElementById('barDenials'), {{
-    type: 'bar',
-    data: {{
-      labels: DATA.denialLabels,
-      datasets: [{{
-        label: 'Denial events',
-        data: DATA.denialValues,
-        backgroundColor: '#c0392b',
-        borderRadius: 4
-      }}]
-    }},
-    options: {{
-      indexAxis: 'y',
-      responsive: true,
-      maintainAspectRatio: false,
-      scales: {{
-        x: {{
-          title: {{ display: true, text: 'Denial events' }},
-          beginAtZero: true,
-          ticks: {{ precision: 0 }}
-        }}
-      }},
-      plugins: {{ legend: {{ display: false }} }}
-    }}
-  }});
+  watchChartResize(pieChart, pieCanvas.parentElement);
 }}
 
 if (SHOW.util && document.getElementById('barUtil')) {{
-  new Chart(document.getElementById('barUtil'), {{
+  const utilCanvas = document.getElementById('barUtil');
+  const utilWrap = utilCanvas.parentElement;
+  const utilCount = DATA.utilLabels.length;
+  utilWrap.style.height = Math.max(280, utilCount * 36) + 'px';
+  const utilChart = new Chart(utilCanvas, {{
     type: 'bar',
     data: {{
       labels: DATA.utilLabels,
@@ -1516,15 +1689,26 @@ if (SHOW.util && document.getElementById('barUtil')) {{
       responsive: true,
       maintainAspectRatio: false,
       scales: {{
+        y: {{
+          ticks: {{
+            autoSkip: false,
+            crossAlign: 'near',
+            padding: 6
+          }},
+          afterFit(scale) {{
+            scale.width = yAxisLabelWidth(scale, DATA.utilLabels);
+          }}
+        }},
         x: {{
           min: 0,
-          suggestedMax: 100,
+          max: 100,
           title: {{ display: true, text: 'Utilization at peak (%)' }}
         }}
       }},
       plugins: {{ legend: {{ display: false }} }}
     }}
   }});
+  watchChartResize(utilChart, utilWrap);
 }}
 </script>
 </body>
@@ -1537,82 +1721,37 @@ if (SHOW.util && document.getElementById('barUtil')) {{
 
 def main():
     parser = argparse.ArgumentParser(
-        description="License usage report: peak concurrent use + denials from ptc_d.log"
+        description="License usage report: peak concurrent use + denials from FlexLM logs"
     )
-    parser.add_argument("--log_file", type=str, default=DEFAULT_LOG_FILE)
-    parser.add_argument("--license_file", type=str, default=LICENSE_FILE,
-                        help="PTC license.dat for owned seat counts; blank to skip")
-    parser.add_argument("--status_file", type=str, default=DEFAULT_STATUS_FILE,
-                        help="Optional ptcstatus file; blank = usage-only")
-    parser.add_argument("--licenses", type=str, default=DEFAULT_LICENSES,
-                        help="Features to analyze, '|' separated; blank = all features")
-    parser.add_argument("--users", type=str, default=DEFAULT_USERS,
-                        help="user@computer filter, '|' separated; empty = all users")
-    parser.add_argument("--capacity", type=str, default=DEFAULT_CAPACITY or None,
-                        help="Optional owned-seat overrides: Feature=N|Feature2=M")
-    parser.add_argument("--lookback_days", type=int, default=DEFAULT_LOOKBACK_DAYS)
-    parser.add_argument("--reporting_days", type=int, default=DEFAULT_REPORTING_DAYS)
-    parser.add_argument("--lookup_file", type=str, default=DEFAULT_LOOKUP_FILE,
-                        help="Feature id → product name lookup file")
-    parser.add_argument("--html_file", type=str, default=DEFAULT_HTML_FILE,
-                        help="Path for the HTML dashboard")
     parser.add_argument("--no_browser", action="store_true",
                         help="Write HTML but do not open a browser")
-    parser.add_argument("--prompt", action="store_true",
-                        help="Prompt interactively instead of using top-of-script defaults")
-
     args = parser.parse_args()
 
-    if args.prompt:
-        log_file = get_input("Location of ptc_d.log file:", DEFAULT_LOG_FILE)
-        license_file = get_input(
-            "license.dat file (blank to skip):", LICENSE_FILE
-        )
-        if not license_file.strip():
-            license_file = None
-        status_file = get_input("ptcstatus output file (blank to skip):", DEFAULT_STATUS_FILE)
-        if not status_file.strip():
-            status_file = None
-        feature_input = get_input(
-            "Licenses to check (blank = all, or separate by '|'):",
-            DEFAULT_LICENSES,
-        )
-        users_input = get_input("Optional user@computer filter (separate by '|'):", DEFAULT_USERS)
-        lookback_days = int(get_input("Lookback days:", str(DEFAULT_LOOKBACK_DAYS)))
-        reporting_days = int(get_input("Reporting days:", str(DEFAULT_REPORTING_DAYS)))
-        capacity_text = args.capacity or DEFAULT_CAPACITY
-    else:
-        log_file = args.log_file
-        license_file = args.license_file or None
-        status_file = args.status_file or None
-        feature_input = args.licenses
-        users_input = args.users
-        lookback_days = args.lookback_days
-        reporting_days = args.reporting_days
-        capacity_text = args.capacity or DEFAULT_CAPACITY
+    log_file, license_file = prompt_for_data_folder()
+    lookback_days = int(
+        get_input("Lookback days (0 = entire log):", str(DEFAULT_LOOKBACK_DAYS))
+    )
+
+    feature_input = DEFAULT_LICENSES
+    users_input = DEFAULT_USERS
+    reporting_days = DEFAULT_REPORTING_DAYS
+    capacity_text = DEFAULT_CAPACITY
+    html_file = DEFAULT_HTML_FILE
 
     features = [f.strip() for f in feature_input.split("|") if f.strip()]
     user_computers = [
         normalize_user(u.strip()) for u in users_input.split("|") if u.strip()
     ] or None
-    lookup = load_license_lookup(args.lookup_file)
-
+    lookup = {}
     owned = {}
     if license_file:
         try:
-            owned = parse_license_dat(license_file)
+            owned, lookup = parse_license_dat(license_file)
             print(f"Loaded owned seats from {license_file}: {owned}")
+            print(f"Loaded {len(lookup)} feature names from {license_file}")
         except FileNotFoundError:
             print(f"Warning: license.dat not found: {license_file}")
             license_file = None
-
-    if status_file:
-        try:
-            owned.update(parse_owned_seats(status_file))
-            print(f"Loaded owned seats from {status_file}: {owned}")
-        except FileNotFoundError:
-            print(f"Warning: status file not found: {status_file}")
-            status_file = None
 
     if capacity_text:
         owned.update(parse_capacity_override(capacity_text))
@@ -1625,7 +1764,7 @@ def main():
         print(f"User filter: {', '.join(user_computers)}")
     print("This may take a moment on large logs...\n")
 
-    stats, lines_read = parse_log(
+    stats, lines_read, unsupported_count = parse_log(
         log_file,
         features,
         owned,
@@ -1634,7 +1773,7 @@ def main():
         user_computers=user_computers,
     )
     print_report(
-        stats, lookback_days, reporting_days, status_file, log_file, lines_read,
+        stats, lookback_days, reporting_days, log_file, lines_read,
         user_computers=user_computers,
         lookup=lookup,
         license_file=license_file,
@@ -1644,13 +1783,13 @@ def main():
         stats,
         lookback_days,
         reporting_days,
-        status_file,
         log_file,
         lines_read,
-        args.html_file,
+        html_file,
         user_computers=user_computers,
         lookup=lookup,
         license_file=license_file,
+        unsupported_count=unsupported_count,
     )
     abs_html = os.path.abspath(html_path)
     print(f"\nHTML dashboard written to: {abs_html}")
