@@ -49,16 +49,16 @@ UNSUPPORTED_PATTERN = re.compile(
 INCREMENT_OWNED_PATTERN = re.compile(
     r"^INCREMENT\s+(\S+)\s+\S+\s+\S+\s+\S+\s+(\d+)\b"
 )
-SERVICEABLE_PATTERN = re.compile(r"^#\s*Serviceable\s*=\s*(.+)$", re.IGNORECASE)
-FEATURE_NAME_PATTERN = re.compile(r"^#\s*Feature Name\s*=\s*(\S+)", re.IGNORECASE)
 DETAIL_TABLE_PATTERN = re.compile(
     r"^#\S+\s+(.+?)\s+SPN-\S+-([FL])-?\s+.+\s+\d+\s+\d{4}-\d{2}-\d{2}\s+([\w,]+)\b"
 )
 SUMMARY_TABLE_ROW = re.compile(
-    r"^#(\S+)\s+\d+\s+(.+?)\s+(?:Creo|Prime)\s+\d+\.\d+\s+(?:Flt|Ext)\s+(?:Lic|Opt)\s+\d{1,2}-\w{3}-\d{4}",
+    r"^#(\S+)\s+\d+\s+(.+?)\s+(?:Creo|Prime)\s+\d+\.\d+\s+"
+    r"(?:Flt|Ext)\s+(?:(?:Lic|Opt)\s+)?"
+    r"\d{1,2}-\w{3}-\d{4}",
     re.IGNORECASE,
 )
-# Summary table uses internal FlexLM labels for some numeric features — keep #Serviceable instead.
+# Cryptic summary-table Product labels — use detail-table description instead.
 SUMMARY_SKIP_NAMES = frozenset({
     "NOTEBOOK",
     "VERIFY",
@@ -201,13 +201,15 @@ def summary_name_usable(name):
     return True
 
 
-def merge_display_names(block_names, summary_names):
-    """Prefer summary-table names except for cryptic internal aliases (NOTEBOOK, etc.)."""
-    merged = dict(block_names)
+def merge_display_names(detail_names, summary_names):
+    """Prefer summary-table Product column; fill gaps from detail table only."""
+    merged = {}
     for feature, raw_name in summary_names.items():
         if not summary_name_usable(raw_name):
             continue
         merged[feature] = clean_product_name(raw_name)
+    for feature, name in detail_names.items():
+        merged.setdefault(feature, name)
     return merged
 
 
@@ -234,17 +236,16 @@ def parse_license_dat(license_file):
     """
     Parse PTC license.dat for owned seat counts and feature display names.
 
-    Names: license-pack summary table (Product column) when readable, else
-    #Serviceable / #Feature Name blocks, with the detail table as fallback
-    (e.g. 10113,PROBUNDLE_10113). Product Package Id suffix in the detail
-    table (-F / -L) records floating vs locked. Duplicate INCREMENT rows are
-    summed; bundle defs with count 99999 are skipped.
+    Names: license-pack **summary table** (FeatureName → Product column), with
+    the detail table as fallback when the Product label is cryptic (NOTEBOOK,
+    PROCESS for MFG, etc.). Product Package Id suffix in the detail table
+    (-F / -L) records floating vs locked. Duplicate INCREMENT rows are summed;
+    bundle defs with count 99999 are skipped.
     """
     owned = defaultdict(int)
-    names = {}
+    detail_names = {}
     license_types = {}
     summary_names = {}
-    current_serviceable = None
     in_summary_table = False
 
     with open(license_file, "r", encoding="utf-8", errors="replace") as f:
@@ -264,24 +265,14 @@ def parse_license_dat(license_file):
                     summary_names[summary_match.group(1)] = summary_match.group(2)
                 continue
 
-            serviceable_match = SERVICEABLE_PATTERN.match(stripped)
-            if serviceable_match:
-                current_serviceable = clean_product_name(serviceable_match.group(1))
-                continue
-
-            feature_match = FEATURE_NAME_PATTERN.match(stripped)
-            if feature_match and current_serviceable:
-                names[feature_match.group(1)] = current_serviceable
-                continue
-
             detail_match = DETAIL_TABLE_PATTERN.match(stripped)
             if detail_match:
                 product_name = clean_product_name(detail_match.group(1))
                 fl_char = detail_match.group(2)
                 for feature in detail_match.group(3).split(","):
                     feature = feature.strip()
-                    if feature and feature not in names:
-                        names[feature] = product_name
+                    if feature:
+                        detail_names.setdefault(feature, product_name)
                     set_license_type(license_types, feature, fl_char)
                 continue
 
@@ -294,7 +285,7 @@ def parse_license_dat(license_file):
                 continue
             owned[name] += count
 
-    return dict(owned), merge_display_names(names, summary_names), dict(license_types)
+    return dict(owned), merge_display_names(detail_names, summary_names), dict(license_types)
 
 
 def display_name(feature, lookup):
@@ -503,12 +494,15 @@ def in_report_window(event_date, now, lookback_days, reporting_days):
 
 def parse_log(log_file, features, owned_seats, lookback_days=0, reporting_days=0,
               user_computers=None):
-    # Empty features list => discover and report all features in the log
+    # Seed every owned feature from license.dat; log may add others not in license.dat
     feature_set = set(features) if features else None
     user_set = set(user_computers) if user_computers else None
+    seed_names = set(owned_seats.keys())
+    if features:
+        seed_names.update(features)
     stats = {
         name: FeatureStats(name, owned_seats.get(name))
-        for name in (features or [])
+        for name in seed_names
     }
 
     def get_stats(feature):
@@ -1298,9 +1292,6 @@ def write_html_report(
                 else f"unknown (at least {card['owned_lower']})"
             )
         )
-        peak_pct = ""
-        if card["owned"] and card["owned"] > 0:
-            peak_pct = f" — {100.0 * card['peak'] / card['owned']:.0f}% of owned"
 
         days_rows = "".join(
             f"<tr><td>{esc(d)}</td><td class=\"num\">{p}</td></tr>"
@@ -1356,7 +1347,7 @@ def write_html_report(
   </header>
   <p class="meaning"><strong>What this means:</strong> {esc(card['meaning'])}</p>
   <div class="metrics">
-    <div><span>Peak concurrent</span><strong>{card['peak']}{esc(peak_pct)}</strong></div>
+    <div><span>Peak concurrent</span><strong>{card['peak']}</strong></div>
     <div><span>Owned seats</span><strong>{esc(owned_txt)}</strong></div>
     <div><span>Denial events</span><strong>{card['denials']}</strong></div>
     <div><span>Users denied</span><strong>{card['unique_denied']}</strong></div>

@@ -61,7 +61,7 @@ Optional: `--no_browser` writes the HTML report without opening a browser.
 | `DEFAULT_CAPACITY` | Optional `Feature=N\|Feature2=M` owned counts (overrides license.dat) |
 | `DEFAULT_HTML_FILE` | HTML dashboard output path |
 
-Owned-seat priority: `license.dat` → `DEFAULT_CAPACITY` (capacity overrides). Duplicate `INCREMENT` lines for the same feature in `license.dat` are summed; `99999` bundle definitions are ignored. Product display names come from the license-pack **summary table** (Product column) when readable; cryptic entries like `NOTEBOOK` / `PROCESS for MFG` fall back to `#Serviceable` / detail-table names.
+Owned-seat priority: `license.dat` → `DEFAULT_CAPACITY` (capacity overrides). Duplicate `INCREMENT` lines for the same feature in `license.dat` are summed; `99999` bundle definitions are ignored. Product display names come from the license-pack **summary table** (FeatureName → Product column); cryptic Product labels like `NOTEBOOK` / `PROCESS for MFG` fall back to the **detail table** only.
 
 ### HTML dashboard
 
@@ -69,7 +69,7 @@ After the text report, the script writes a self-contained webpage with:
 
 - KPI summary (features analyzed, ran-out count, under-used count, denial events)
 - Plain-language **key findings** (includes **unique Creo users**, users on **more than one computer**, and **UNSUPPORTED** license requests in the lookback window; checkout or denial activity across all features)
-- Features with **no usage in the report window** and **no owned count** from `license.dat` are omitted; so are **numeric-only FlexLM IDs** (e.g. `308`) that are not defined in `license.dat` (old optional-module noise)
+- Every feature with an **owned seat count** in `license.dat` gets a card (including **unused** — no log activity required). Log-only features with no owned count and no window usage are omitted; so are **numeric-only FlexLM IDs** (e.g. `308`) not defined in `license.dat`
 - Doughnut chart of utilization outcomes
 - Bar chart for peak vs owned seats %
 - Per-feature cards with “what this means” text (product names from `license.dat`; **(Floating)** / **(Locked)** from detail-table Product Package Id `SPN-*-F` / `SPN-*-L`)
